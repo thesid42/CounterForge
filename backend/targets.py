@@ -77,3 +77,6 @@ class DVAATarget:
             return r.status_code < 500
         except Exception:
             return False
+
+    async def close(self) -> None:
+        await self.client.aclose()

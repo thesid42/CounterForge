@@ -44,6 +44,7 @@ class ChatRequest(BaseModel):
 class LabRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scenario: Literal["all", "runbook-injection", "tool-result-injection", "role-escalation", "data-extraction"] = "all"
+    apply_defense: bool = True
 
 
 class ApprovalRequest(BaseModel):

@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass
-from .fixtures import CANARY
+from .fixtures import CANARY, PLANTED_MARKERS
 from .redforge import check_extraction_breach
 
 
@@ -44,7 +44,9 @@ def evaluate_tool(policy: Policy, name: str, arguments: dict, source: str = "use
 
 
 def redact(text: str) -> str:
-    return text.replace(CANARY, "[REDACTED]")
+    for marker in PLANTED_MARKERS:
+        text = text.replace(marker, "[REDACTED]")
+    return text
 
 
 def check_output(text: str) -> bool:

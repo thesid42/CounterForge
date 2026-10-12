@@ -51,6 +51,91 @@ const SCENARIOS = [
   ["role-escalation", "Operator impersonation"],
   ["data-extraction", "Protected-context extraction"],
 ];
+
+const STAGE_COPY = {
+  queued: {
+    title: "Queued",
+    detail: "Waiting to start the adaptive campaign.",
+  },
+  generate: {
+    title: "Preparing attack objectives",
+    detail: "Loading the scenario seeds for the attacker model.",
+  },
+  execute: {
+    title: "Attacker probing the live target",
+    detail:
+      "The attacker model is crafting prompts and hitting DVAA. Watch for a baseline breach.",
+  },
+  inspect: {
+    title: "Inspecting the breach",
+    detail:
+      "Summarizing tool use and target behavior from the unprotected run.",
+  },
+  propose: {
+    title: "Defender writing protection",
+    detail:
+      "The defender model is turning the observed breach into a defense script.",
+  },
+  replay: {
+    title: "Replaying with defense on",
+    detail:
+      "Same attack, now with the defender script and gateway. This should block the breach.",
+  },
+  complete: {
+    title: "Comparison complete",
+    detail: "Baseline vs defended results are ready to review.",
+  },
+  error: {
+    title: "Run failed",
+    detail: "The evaluation stopped early. Check the error banner.",
+  },
+};
+const ATTACK_TYPE_LABELS = {
+  "runbook-injection": "Poisoned runbook injection",
+  "tool-result-injection": "Tool-result injection",
+  "role-escalation": "Operator impersonation",
+  "data-extraction": "Protected-context extraction",
+  prompt_injection: "Prompt injection",
+  role_manipulation: "Role manipulation",
+  data_extraction: "Data extraction",
+};
+function attackTypeLabel(result, scenario) {
+  if (!result && !scenario) return "Adaptive attack";
+  const seed = result?.seed_id || result?.id?.replace(/-r\d+$/, "") || scenario;
+  if (ATTACK_TYPE_LABELS[seed]) return ATTACK_TYPE_LABELS[seed];
+  if (result?.category && ATTACK_TYPE_LABELS[result.category]) {
+    return ATTACK_TYPE_LABELS[result.category];
+  }
+  return result?.name || seed || "Adaptive attack";
+}
+function breachSummary(result) {
+  if (!result?.baseline) return "Waiting for baseline result.";
+  if (result.baseline.verdict === "succeeded") {
+    const tools = (result.observation?.tools_invoked || [])
+      .map((t) => (typeof t === "string" ? t : t.name))
+      .filter(Boolean);
+    const toolText = tools.length ? ` via ${tools.join(", ")}` : "";
+    return `${attackTypeLabel(result)} breached the unprotected target${toolText}.`;
+  }
+  if (result.baseline.verdict === "blocked") {
+    return `${attackTypeLabel(result)} did not breach the unprotected target.`;
+  }
+  return `Baseline ended with ${result.baseline.verdict}.`;
+}
+function defenseSummary(result) {
+  if (!result?.defended) return "Defense replay pending.";
+  if (result.defended.verdict === "skipped") {
+    return "Defense toggle was off, so the protected replay was skipped for comparison.";
+  }
+  if (result.defended.verdict === "blocked") {
+    const enforced = result.defended.defense_enforced
+      ? " Defender script + gateway blocked the retry."
+      : " Protected replay blocked the retry.";
+    return `Next iteration blocked.${enforced}`;
+  }
+  return `Protected replay still showed ${result.defended.verdict}.`;
+}
+
 const timeLabel = (value) =>
   new Date(value).toLocaleTimeString([], {
     hour: "2-digit",
@@ -93,10 +178,11 @@ function Badge({ children, tone = "", icon: Icon }) {
   );
 }
 function Empty({ icon: Icon = Shield, title, children }) {
+  const spinning = Icon === Loader2;
   return (
     <div className="empty">
       <span className="empty-icon">
-        <Icon size={27} />
+        <Icon size={27} className={spinning ? "spin" : undefined} />
       </span>
       <h3>{title}</h3>
       <p>{children}</p>
@@ -121,6 +207,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [scenario, setScenario] = useState("all");
+  const [applyDefense, setApplyDefense] = useState(true);
   const [run, setRun] = useState(null);
   const [selectedResult, setSelectedResult] = useState(0);
   const [selectedIncident, setSelectedIncident] = useState(null);
@@ -254,20 +341,35 @@ export default function App() {
   }
   async function startRun() {
     await perform(async () => {
-      const next = await api("/lab/runs", { scenario });
+      const next = await api("/lab/runs", {
+        scenario,
+        apply_defense: applyDefense,
+      });
+      setSelectedResult(0);
+      setRun(next);
+      await refresh();
+    });
+  }
+  async function openRun(id) {
+    await perform(async () => {
+      const next = await api("/lab/runs/" + id);
       setSelectedResult(0);
       setRun(next);
     });
   }
   async function approve() {
     await perform(async () => {
-      await api("/actions/" + approval.id + "/approve", {
+      const approved = await api("/actions/" + approval.id + "/approve", {
         token: approval.token,
       });
       setApproval(null);
       await refresh();
       setNotice(
-        "Simulated voice notification accepted. No phone call was placed.",
+        approved.delivery.status === "Failed"
+          ? "Voice notification failed. The incident remains contained."
+          : approved.delivery.mode === "twilio_voice"
+            ? "Twilio accepted the sanitized voice call."
+            : "Simulated voice notification accepted. No phone call was placed.",
       );
     });
   }
@@ -290,6 +392,8 @@ export default function App() {
   const completed = run?.status === "completed";
   const prevented =
     run?.results?.filter((r) => r.defended?.verdict === "blocked").length || 0;
+  const liveAlerts = overview?.alert_mode === "twilio_voice";
+  const adaptive = overview?.role_mode === "adaptive";
 
   function ApprovalCard({ action }) {
     const value = currentAction(action);
@@ -304,15 +408,27 @@ export default function App() {
               : "Page the responder?"}
           </strong>
         </div>
-        <Badge tone={value.status === "approved" ? "safe" : "warning"}>
+        <Badge
+          tone={
+            value.delivery?.status === "Failed"
+              ? "danger"
+              : value.status === "approved"
+                ? "safe"
+                : "warning"
+          }
+        >
           {value.status === "approved"
-            ? "Simulation accepted"
+            ? value.delivery?.status || "Approved"
             : "Approval required"}
         </Badge>
         <p>
           {value.status === "approved"
-            ? "A simulated notification was recorded. No external call was placed."
-            : "Review the exact message for the allowlisted primary responder."}
+            ? value.delivery?.status === "Failed"
+              ? "The provider rejected the alert. The incident remains contained."
+              : value.delivery?.mode === "twilio_voice"
+                ? "The sanitized voice call was submitted to Twilio."
+                : "A simulated notification was recorded. No external call was placed."
+            : `Review the exact message for the allowlisted primary responder${liveAlerts ? " before placing the call" : ""}.`}
         </p>
         {value.status === "pending" && (
           <Button className="primary full" onClick={() => setApproval(value)}>
@@ -343,7 +459,13 @@ export default function App() {
                     ? "warning"
                     : "safe"
             }
-            icon={!data ? Clock3 : data.verdict === "succeeded" ? TriangleAlert : ShieldCheck}
+            icon={
+              !data
+                ? Clock3
+                : data.verdict === "succeeded"
+                  ? TriangleAlert
+                  : ShieldCheck
+            }
           >
             {!data
               ? "Waiting"
@@ -355,8 +477,17 @@ export default function App() {
           </Badge>
         </div>
         {!data ? (
-          <Empty icon={FlaskConical} title="Ready for a comparison">
-            Run a scenario to inspect live target execution.
+          <Empty
+            icon={run?.status === "running" ? Loader2 : FlaskConical}
+            title={
+              run?.status === "running"
+                ? (STAGE_COPY[run.stage] || STAGE_COPY.queued).title
+                : "Ready for a comparison"
+            }
+          >
+            {run?.status === "running"
+              ? (STAGE_COPY[run.stage] || STAGE_COPY.queued).detail
+              : "Run a scenario to inspect live target execution."}
           </Empty>
         ) : (
           <div className="trace-content">
@@ -374,6 +505,22 @@ export default function App() {
               <div>
                 <small>{result.surface.replace("_", " ")} attack surface</small>
                 <pre>{data.request_content || result.payload}</pre>
+                {result.strategy && !defended && (
+                  <p className="trace-response">
+                    Attacker strategy: {result.strategy}
+                  </p>
+                )}
+                {result.defended?.verdict === "skipped" && (
+                  <p className="muted">
+                    Defense toggle was off — protected replay skipped for
+                    comparison.
+                  </p>
+                )}
+                {defended && result.defense?.rationale && (
+                  <p className="trace-response">
+                    Defender rationale: {result.defense.rationale}
+                  </p>
+                )}
               </div>
             </div>
             <div className="trace-row">
@@ -381,7 +528,8 @@ export default function App() {
               <div>
                 <small>Execution trace</small>
                 <pre>
-                  {data.trace[0].tool} → {data.trace[0].decision}
+                  {data.trace?.[0]?.tool || "target"} →{" "}
+                  {data.trace?.[0]?.decision || data.verdict}
                   <br />
                   {data.reason}
                 </pre>
@@ -452,8 +600,14 @@ export default function App() {
           <div className="environment">
             <span className="status-dot" />
             <div>
-              <strong>Local simulation</strong>
-              <small>External providers disconnected</small>
+              <strong>
+                {adaptive ? "Adaptive model lab" : "Configure live lab"}
+              </strong>
+              <small>
+                {adaptive
+                  ? `${overview.attacker_model} · ${overview.defender_model}`
+                  : "Hosted model roles disconnected"}
+              </small>
             </div>
           </div>
           <div className="profile">
@@ -483,13 +637,15 @@ export default function App() {
           </div>
           <div className="topbar-right">
             <Badge icon={FlaskConical}>
-              {overview?.mode === "live" ? "Live target" : "Demo mode"}
+              {overview?.lab_ready || overview?.role_mode === "adaptive"
+                ? "Live adaptive lab"
+                : "Lab not configured"}
             </Badge>
             <Badge tone="safe">
               <span className="status-dot" />
-              {overview?.mode === "live"
+              {overview?.lab_ready || overview?.mode === "live"
                 ? "DVAA · Ollama (live)"
-                : "Local fixture target"}
+                : "Target not configured"}
             </Badge>
             <span className="operator-circle">S</span>
           </div>
@@ -678,7 +834,7 @@ export default function App() {
                         <span className={"toggle " + (poisoned ? "on" : "")} />
                         <span>Use injected runbook</span>
                         <Badge tone={poisoned ? "warning" : ""}>
-                          {poisoned ? "Attack fixture" : "Clean fixture"}
+                          {poisoned ? "Injected runbook" : "Clean runbook"}
                         </Badge>
                       </label>
                       <form
@@ -781,227 +937,322 @@ export default function App() {
                       <span className="title-dot">.</span>
                     </h1>
                     <p>
-                      Replay a scenario against a versioned defense, then
-                      inspect the evidence.
+                      Choose an attack surface, run it, and compare the target
+                      before and after defense.
                     </p>
                   </div>
                 </div>
-                <div className="lab-controls">
-                  <div>
-                    <label>Target</label>
-                    <select aria-label="Lab target">
-                      <option>
-                        {overview?.mode === "live"
-                          ? "DVAA RAGBot · local Ollama (live)"
-                          : "Local fixture target"}
-                      </option>
-                    </select>
+                <div className="lab-launch panel">
+                  <div className="lab-launch-copy">
+                    <strong>New comparison</strong>
+                    <span>
+                      {overview?.lab_ready || overview?.mode === "live"
+                        ? "Live DVAA target"
+                        : "Target setup required"}
+                      {adaptive
+                        ? ` · Adaptive attacker and defender · ${overview.attack_rounds} rounds`
+                        : " · Model roles not configured"}
+                    </span>
                   </div>
-                  <div>
-                    <label>Scenario</label>
-                    <select
-                      aria-label="Attack scenario"
-                      value={scenario}
-                      onChange={(e) => setScenario(e.target.value)}
+                  <div className="lab-controls">
+                    <div>
+                      <label>Scenario</label>
+                      <select
+                        aria-label="Attack scenario"
+                        value={scenario}
+                        onChange={(e) => setScenario(e.target.value)}
+                      >
+                        {SCENARIOS.map(([id, label]) => (
+                          <option key={id} value={id}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <label
+                      className="fixture-toggle"
+                      title="Turn off to compare the unprotected baseline"
                     >
-                      {SCENARIOS.map(([id, label]) => (
-                        <option key={id} value={id}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="control-spacer" />
-                  <Badge icon={LockKeyhole}>In-memory test sink</Badge>
-                  <Button
-                    icon={run?.status === "running" ? Loader2 : FlaskConical}
-                    className="primary"
-                    disabled={busy || run?.status === "running"}
-                    onClick={startRun}
-                  >
-                    {run?.status === "running"
-                      ? "Running comparison"
-                      : "Run comparison"}
-                  </Button>
-                </div>
-                <div className="metrics">
-                  <Metric
-                    value={run?.results?.length || "—"}
-                    label="Attack scenarios"
-                  />
-                  <Metric
-                    value={completed ? prevented : "—"}
-                    label="Prevented in replay"
-                    tone="safe"
-                  />
-                  <Metric
-                    value={
-                      completed
-                        ? run.results.reduce(
-                            (n, r) => n + r.defended.unauthorized_actions,
-                            0,
-                          )
-                        : "—"
-                    }
-                    label="Unauthorized actions"
-                  />
-                  <Metric
-                    value={
-                      run?.validation
-                        ? `${run.validation.benign_passed}/${run.validation.benign_total}`
-                        : "—"
-                    }
-                    label="Benign tools passed"
-                  />
-                </div>
-                <div className="stage-bar">
-                  {STAGES.map((s, i) => {
-                    const index = completed ? 5 : STAGES.indexOf(run?.stage);
-                    return (
-                      <div
-                        key={s}
-                        className={
-                          (index > i ? "done " : "") +
-                          (index === i ? "current" : "")
+                      <input
+                        type="checkbox"
+                        checked={applyDefense}
+                        onChange={(e) => setApplyDefense(e.target.checked)}
+                      />
+                      <span
+                        className={"toggle " + (applyDefense ? "on" : "")}
+                      />
+                      <Badge tone={applyDefense ? "safe" : "warning"}>
+                        {applyDefense ? "Defense on" : "Defense off"}
+                      </Badge>
+                    </label>
+                    {overview?.active_defense?.system_prompt && (
+                      <Button
+                        className="quiet"
+                        disabled={busy}
+                        onClick={() =>
+                          perform(async () => {
+                            await api("/defenses/clear", {});
+                            await refresh();
+                            setNotice("Active defense script cleared.");
+                          })
                         }
                       >
-                        <span>{index > i ? <Check size={13} /> : i + 1}</span>
-                        {s[0].toUpperCase() + s.slice(1)}
-                        {i < 4 && <i />}
-                      </div>
-                    );
-                  })}
+                        Clear defense
+                      </Button>
+                    )}
+                    <Button
+                      icon={run?.status === "running" ? Loader2 : FlaskConical}
+                      className="primary"
+                      disabled={busy || run?.status === "running"}
+                      onClick={startRun}
+                    >
+                      {run?.status === "running"
+                        ? "Running comparison"
+                        : "Run comparison"}
+                    </Button>
+                  </div>
                 </div>
+                {run?.status === "running" && (
+                  <div
+                    className="lab-progress panel"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <div className="lab-progress-main">
+                      <Loader2
+                        className="spin lab-progress-spinner"
+                        size={28}
+                      />
+                      <div>
+                        <div className="eyebrow">IN PROGRESS</div>
+                        <h3>
+                          {(STAGE_COPY[run.stage] || STAGE_COPY.queued).title}
+                        </h3>
+                        <p>
+                          {(STAGE_COPY[run.stage] || STAGE_COPY.queued).detail}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="lab-progress-steps">
+                      {STAGES.map((s) => {
+                        const idx = STAGES.indexOf(run.stage);
+                        const mine = STAGES.indexOf(s);
+                        const state =
+                          mine < idx ? "done" : mine === idx ? "current" : "";
+                        return (
+                          <div key={s} className={"lab-progress-step " + state}>
+                            {mine < idx ? (
+                              <CheckCircle2 size={16} />
+                            ) : mine === idx ? (
+                              <Loader2 className="spin" size={16} />
+                            ) : (
+                              <Circle size={16} />
+                            )}
+                            <span>{s}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {!!run.results?.length && (
+                      <div className="lab-progress-live">
+                        <TriangleAlert size={16} />
+                        <span>
+                          {breachSummary(run.results[run.results.length - 1])}
+                          {run.stage === "propose" || run.stage === "replay"
+                            ? " Defender is responding…"
+                            : ""}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {completed && (
+                  <div className="metrics lab-metrics">
+                    <Metric
+                      value={run?.results?.length || "—"}
+                      label="Attacks tested"
+                    />
+                    <Metric
+                      value={prevented}
+                      label="Blocked after defense"
+                      tone="safe"
+                    />
+                    <Metric
+                      value={
+                        run?.validation
+                          ? `${run.validation.benign_passed}/${run.validation.benign_total}`
+                          : "—"
+                      }
+                      label="Safe tools still work"
+                    />
+                  </div>
+                )}
+                {completed && !!run.results?.length && (
+                  <div className="lab-story panel">
+                    <div className="panel-header">
+                      <div>
+                        <h3>Attack results</h3>
+                        <small>Select one to inspect the comparison</small>
+                      </div>
+                      <Badge tone={run.validated ? "safe" : "warning"}>
+                        {run.validated ? "Defense held" : "Needs review"}
+                      </Badge>
+                    </div>
+                    <div className="lab-story-grid">
+                      {run.results.map((r, index) => (
+                        <button
+                          type="button"
+                          key={r.id}
+                          className={
+                            "lab-story-card" +
+                            (selectedResult === index ? " selected" : "")
+                          }
+                          onClick={() => setSelectedResult(index)}
+                        >
+                          <div className="lab-story-topline">
+                            <strong>{attackTypeLabel(r, run.scenario)}</strong>
+                            {r.round ? <Badge>Round {r.round}</Badge> : null}
+                          </div>
+                          <div className="lab-story-row breach">
+                            <TriangleAlert size={16} />
+                            <div>
+                              <small>Baseline attack</small>
+                              <p>{breachSummary(r)}</p>
+                            </div>
+                          </div>
+                          <div className="lab-story-row defend">
+                            <ShieldCheck size={16} />
+                            <div>
+                              <small>Defended iteration</small>
+                              <p>{defenseSummary(r)}</p>
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {run?.status === "failed" && (
                   <div className="error-banner">
                     Evaluation failed: {run.error}
-                  </div>
-                )}
-                {run?.results.length > 0 && (
-                  <div className="scenario-tabs">
-                    {run.results.map((r, i) => (
-                      <button
-                        className={selectedResult === i ? "selected" : ""}
-                        key={r.id}
-                        onClick={() => setSelectedResult(i)}
-                      >
-                        {r.name}
-                      </button>
-                    ))}
                   </div>
                 )}
                 <div className="comparison-grid">
                   <Transcript />
                   <Transcript defended />
                 </div>
-                <div className="lab-bottom">
-                  <div className="panel">
-                    <div className="panel-header">
-                      <h3>Replay evidence</h3>
-                      {completed && (
-                        <a
-                          className="text-link"
-                          href={"/api/reports/" + run.id}
-                        >
-                          <ArrowDownToLine size={14} />
-                          Export report
-                        </a>
-                      )}
+                {run?.results?.length > 0 && (
+                  <div className="panel candidate-card lab-defense-summary">
+                    <div className="lab-defense-copy">
+                      <FileText size={21} />
+                      <div>
+                        <h3>Generated defense</h3>
+                        <p>
+                          {run?.proposal?.description ||
+                            "The defender workflow will propose a rule based on observed execution."}
+                        </p>
+                      </div>
                     </div>
-                    {!run?.results.length ? (
-                      <Empty
-                        icon={GitBranch}
-                        title="Build a reproducible comparison"
-                      >
-                        Each run starts with isolated fixture state.
-                      </Empty>
-                    ) : (
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Scenario</th>
-                            <th>Baseline</th>
-                            <th>Defense</th>
-                            <th>Outcome</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {run.results.map((r) => (
-                            <tr key={r.id}>
-                              <td>{r.name}</td>
-                              <td>
-                                <Badge tone="danger">Breached</Badge>
-                              </td>
-                              <td>
-                                <Badge tone={r.defended ? "safe" : ""}>
-                                  {r.defended ? "Blocked" : "Pending"}
-                                </Badge>
-                              </td>
-                              <td className="text-safe">
-                                {r.defended ? "Improved" : "Evaluating"}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                  <div className="panel candidate-card">
-                    <FileText size={21} />
-                    <h3>Candidate policy</h3>
-                    <p>
-                      {run?.proposal?.description ||
-                        "The defender workflow will propose a rule based on observed execution."}
-                    </p>
-                    <div className="candidate-status">
-                      <span>Status</span>
+                    <div className="lab-defense-actions">
                       <Badge
                         tone={run?.validated ? "safe" : ""}
                         icon={run?.validated ? CheckCircle2 : Clock3}
                       >
                         {run?.activated
-                          ? run.candidate.version === overview.policy.version
-                            ? "Active"
-                            : "Previously activated"
+                          ? "Active"
                           : run?.validated
-                            ? "Validated in simulation"
+                            ? "Validated"
                             : "Awaiting evidence"}
                       </Badge>
+                      {completed && (
+                        <a
+                          className="text-link"
+                          href={"/api/reports/" + run.id}
+                        >
+                          <ArrowDownToLine size={14} /> Export
+                        </a>
+                      )}
+                      <Button
+                        disabled={!run?.candidate}
+                        onClick={() => setShowRule(true)}
+                      >
+                        View rule
+                      </Button>
+                      <Button
+                        className="primary"
+                        disabled={
+                          busy ||
+                          !run?.validated ||
+                          run.activated ||
+                          run.base_version !== overview.policy.version
+                        }
+                        onClick={activate}
+                      >
+                        {run?.activated ? "Activated" : "Activate"}
+                      </Button>
                     </div>
-                    {run?.validation && (
-                      <small>
-                        {run.validation.held_out_blocked}/
-                        {run.validation.held_out_total} held-out fixtures
-                        blocked
-                      </small>
-                    )}
-                    <Button
-                      className="full"
-                      disabled={!run?.candidate}
-                      onClick={() => setShowRule(true)}
-                    >
-                      View rule <ChevronRight size={15} />
-                    </Button>
-                    <Button
-                      className="primary full"
-                      disabled={
-                        busy ||
-                        !run?.validated ||
-                        run.activated ||
-                        run.base_version !== overview.policy.version
-                      }
-                      onClick={activate}
-                    >
-                      {run?.activated
-                        ? "Policy activated"
-                        : "Activate in local lab"}
-                    </Button>
                   </div>
-                </div>
+                )}
                 <div className="footnote">
-                  <Info size={13} /> Executable synthetic fixtures, not a live
-                  model evaluation. GLM integration comes next.
+                  <Info size={13} />{" "}
+                  {adaptive
+                    ? "The attacker probes the live target, the defender responds, and the same attack is replayed for a direct comparison."
+                    : "Configure OpenRouter roles and the local DVAA target to run the adaptive lab."}
                 </div>
+                <details className="lab-history panel">
+                  <summary>
+                    <span>
+                      <Clock3 size={16} /> Previous runs
+                    </span>
+                    <Badge>{overview?.runs?.length || 0} saved</Badge>
+                  </summary>
+                  <div className="lab-history-list">
+                    {(overview?.runs || []).map((item) => (
+                      <button
+                        key={item.id}
+                        className={
+                          "lab-history-item" +
+                          (run?.id === item.id ? " selected" : "")
+                        }
+                        onClick={() => openRun(item.id)}
+                        disabled={
+                          busy ||
+                          (item.status === "running" && run?.id !== item.id)
+                        }
+                      >
+                        <div>
+                          <strong>
+                            {SCENARIOS.find(
+                              (s) => s[0] === item.scenario,
+                            )?.[1] || item.scenario}
+                          </strong>
+                          <small>
+                            {item.created_at
+                              ? new Date(item.created_at).toLocaleString()
+                              : "Unknown time"}
+                          </small>
+                        </div>
+                        <Badge
+                          tone={
+                            item.status === "completed"
+                              ? item.validated
+                                ? "safe"
+                                : ""
+                              : item.status === "failed"
+                                ? "danger"
+                                : "warning"
+                          }
+                        >
+                          {item.status === "running"
+                            ? item.stage || "running"
+                            : item.validated
+                              ? "defended"
+                              : item.status}
+                        </Badge>
+                      </button>
+                    ))}
+                  </div>
+                </details>
               </>
             )}
             {page === "Defenses" && (
@@ -1270,7 +1521,11 @@ export default function App() {
                           </div>
                           <dl>
                             <dt>Channel</dt>
-                            <dd>Simulated voice</dd>
+                            <dd>
+                              {selected.delivery.mode === "twilio_voice"
+                                ? "Twilio voice"
+                                : "Simulated voice"}
+                            </dd>
                             <dt>Delivery</dt>
                             <dd>{selected.delivery.status}</dd>
                             <dt>Attempts</dt>
@@ -1280,7 +1535,11 @@ export default function App() {
                           </dl>
                           <div className="footnote">
                             <Info size={14} />
-                            No external phone call is placed.
+                            {selected.delivery.mode === "twilio_voice"
+                              ? selected.delivery.status === "Accepted"
+                                ? "Provider acceptance does not prove the responder answered."
+                                : "The failed alert did not weaken incident containment."
+                              : "No external phone call is placed."}
                           </div>
                         </div>
                         {actions.find(
@@ -1322,7 +1581,7 @@ export default function App() {
                             })
                           }
                         >
-                          Acknowledge simulation
+                          Acknowledge alert
                         </Button>
                         <Button
                           className="primary full"
@@ -1424,8 +1683,8 @@ export default function App() {
                 </div>
                 <div className="footnote">
                   <Info size={13} />
-                  Reports contain redacted execution evidence. Fixture results
-                  do not measure real-model robustness.
+                  Reports contain redacted execution evidence from this isolated
+                  lab run.
                 </div>
               </>
             )}
@@ -1441,8 +1700,8 @@ export default function App() {
                       <span className="title-dot">.</span>
                     </h1>
                     <p>
-                      The local demo works today. Model and alert APIs connect
-                      later.
+                      Live adaptive roles and the local DVAA target power this
+                      hackathon build. Alert delivery is configured server-side.
                     </p>
                   </div>
                 </div>
@@ -1451,43 +1710,51 @@ export default function App() {
                     <div className="section-top">
                       <Sparkles size={22} />
                       <h3>Model roles</h3>
-                      <Badge>Not connected</Badge>
+                      <Badge tone={adaptive ? "safe" : "warning"}>
+                        {adaptive ? "Live adaptive" : "Not configured"}
+                      </Badge>
                     </div>
                     <p>
-                      The attacker and defender analyst have separate adapter
-                      boundaries. No API keys are required for fixture mode.
+                      Attacker and defender call OpenRouter. The target stays on
+                      local DVAA backed by Ollama.
                     </p>
                     <dl>
                       <dt>Attacker</dt>
-                      <dd>GLM-5.3-Flash · planned</dd>
+                      <dd>{overview.attacker_model || "Not configured"}</dd>
                       <dt>Defender analyst</dt>
-                      <dd>GLM-5.3-Flash · planned</dd>
-                      <dt>Current assistant</dt>
-                      <dd>Deterministic local fixture</dd>
+                      <dd>{overview.defender_model || "Not configured"}</dd>
+                      <dt>Adaptive rounds</dt>
+                      <dd>{overview.attack_rounds || 0}</dd>
                       <dt>Target</dt>
-                      <dd>Local synthetic tool harness</dd>
+                      <dd>
+                        {overview.lab_ready
+                          ? "DVAA · local Ollama"
+                          : "Not configured"}
+                      </dd>
                     </dl>
                     <div className="config-note">
                       <Terminal size={15} />
-                      Configure model endpoints server-side when API integration
-                      is added.
+                      Role keys and target URLs are configured server-side in
+                      .env.
                     </div>
                   </div>
                   <div className="panel settings-card">
                     <div className="section-top">
                       <Phone size={22} />
                       <h3>Alert providers</h3>
-                      <Badge tone="warning">Simulation only</Badge>
+                      <Badge tone={liveAlerts ? "safe" : "warning"}>
+                        {liveAlerts ? "Twilio voice ready" : "Simulation only"}
+                      </Badge>
                     </div>
                     <p>
-                      The operator reviews an expiring message before the
-                      dispatcher records a simulated notification.
+                      The operator reviews an expiring, sanitized message before
+                      the dispatcher sends it.
                     </p>
                     <dl>
                       <dt>Current mode</dt>
-                      <dd>Simulated voice</dd>
-                      <dt>PagerDuty / Twilio</dt>
-                      <dd>Integration pending</dd>
+                      <dd>{liveAlerts ? "Twilio voice" : "Simulated voice"}</dd>
+                      <dt>Trigger</dt>
+                      <dd>Approved defender finding</dd>
                       <dt>Responder</dt>
                       <dd>Primary · allowlisted</dd>
                       <dt>Duplicate suppression</dt>
@@ -1502,12 +1769,11 @@ export default function App() {
                 <div className="panel defense-explainer">
                   <Info size={22} />
                   <div>
-                    <h3>Local demo boundary</h3>
+                    <h3>Hackathon lab boundary</h3>
                     <p>
-                      Fixtures execute in isolated in-memory state. This build
-                      does not launch a Docker sandbox or run a model.
-                      CrowdStrike's target adapter and container isolation are
-                      the next integration phase.
+                      Adaptive attacker and defender models run against the
+                      localhost-only DVAA target. Synthetic markers stay in the
+                      lab; no public-network exfiltration is used.
                     </p>
                   </div>
                 </div>
@@ -1541,8 +1807,9 @@ export default function App() {
             <Badge tone="warning">Operator approval</Badge>
             <h2 id="approval-title">Review the paging action.</h2>
             <p>
-              This authorizes one simulated notification to the configured
-              responder.
+              This authorizes one{" "}
+              {liveAlerts ? "Twilio voice call" : "simulated notification"} to
+              the configured responder.
             </p>
             <dl>
               <dt>Incident</dt>
@@ -1563,7 +1830,11 @@ export default function App() {
                 Cancel
               </Button>
               <Button disabled={busy} className="primary" onClick={approve}>
-                {busy ? "Processing…" : "Approve simulation"}
+                {busy
+                  ? "Processing…"
+                  : liveAlerts
+                    ? "Approve call"
+                    : "Approve simulation"}
               </Button>
             </div>
           </section>
