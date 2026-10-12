@@ -129,7 +129,10 @@ class TwilioVoiceDispatcher:
     def dispatch(self, message: str, incident_id: str):
         # The message is a server-owned, sanitized template. No evidence, model
         # output, phone number, or destination supplied by an agent reaches Twilio.
-        twiml = f'<Response><Say>{escape(message)}</Say></Response>'
+        said = f'<Say voice="alice">{escape(message)}</Say>'
+        # Pause first so the speech isn't clipped after a trial notice/keypress,
+        # and repeat once so the responder reliably hears it.
+        twiml = f'<Response><Pause length="1"/>{said}<Pause length="1"/>{said}</Response>'
         url = (
             "https://api.twilio.com/2010-04-01/Accounts/"
             f"{self.settings.twilio_account_sid}/Calls.json"

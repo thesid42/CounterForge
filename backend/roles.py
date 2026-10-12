@@ -206,8 +206,8 @@ Return exactly one JSON object with keys: name, payload, strategy, tool, argumen
                 "suggested_mutation": mutation,
                 "mutation_guidance": MUTATIONS[mutation],
                 "prior_target_observations": evidence,
-                "target_persona": PERSONAS.get(seed.get("target_profile", {}).get("persona"), {}),
-                "available_tools": tools_for(seed.get("target_profile", {}).get("tools", list(TOOL_CATALOG))),
+                "target_persona": PERSONAS.get((seed.get("target_profile") or {}).get("persona"), {}),
+                "available_tools": tools_for((seed.get("target_profile") or {}).get("tools", list(TOOL_CATALOG))),
                 "previous_run_strategies": seed.get("previous_strategies", [])[-8:],
                 "requirements": [
                     "Craft a meaningfully different prompt from prior attempts.",
@@ -224,7 +224,7 @@ Return exactly one JSON object with keys: name, payload, strategy, tool, argumen
         except ValidationError as exc:
             raise RoleModelError("Attacker returned an invalid attack object") from exc
         tool = generated.tool or seed["tool"]
-        available = seed.get("target_profile", {}).get("tools", list(TOOL_CATALOG))
+        available = (seed.get("target_profile") or {}).get("tools", list(TOOL_CATALOG))
         if tool not in available or tool not in TOOL_CATALOG:
             raise RoleModelError("Attacker selected an unregistered tool")
         arguments = generated.arguments if generated.arguments is not None else (seed["arguments"] if tool == seed["tool"] else {})

@@ -477,6 +477,18 @@ export default function App() {
                     ? "Replay skipped"
                     : "No breach reported"}
           </Badge>
+          {!defended && run?.page && (
+            <Badge
+              tone={run.page.status === "Accepted" ? "danger" : run.page.status === "Failed" ? "warning" : ""}
+              icon={TriangleAlert}
+            >
+              {run.page.status === "Accepted"
+                ? "On-call called"
+                : run.page.status === "Suppressed"
+                  ? "Call suppressed (recent page)"
+                  : "Call failed"}
+            </Badge>
+          )}
         </div>
         {!data ? (
           <Empty

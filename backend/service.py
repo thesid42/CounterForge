@@ -1,3 +1,4 @@
+import os
 import asyncio
 import hmac
 import json
@@ -173,7 +174,7 @@ def _run_dvaa_sync(attack: dict, defense_prompt: str | None = None) -> dict:
 
 
 async def execute_lab_attack_async(attack: dict, policy, defense_prompt: str | None = None) -> dict:
-    if attack.get("target_profile", {}).get("adapter") == "managed":
+    if (attack.get("target_profile") or {}).get("adapter") == "managed":
         from .agent_runtime import run_agent
         return await run_agent(attack, policy, defense_prompt)
     if settings.MODEL_MODE != "demo" and settings.TARGET_BASE_URL:
@@ -410,7 +411,38 @@ class LabService:
             "The lab observed a synthetic leak or unauthorized action in the vulnerable baseline. Protected evidence is redacted.",
         )
         action = self.create_action(run["id"], incident["id"], incident["id"])
-        return {"incident": incident, "action": action}
+        page = self.page_breach(incident)
+        return {"incident": incident, "action": action, "page": page}
+
+    BREACH_PAGE_MESSAGE = "CounterForge alert. Breach detected. Check the CounterForge platform."
+
+    def page_breach(self, incident):
+        """Automatically page the on-call number when the lab sees a breach."""
+        if os.getenv("AUTO_PAGE_ON_BREACH", "true").lower() in {"0", "false", "no"}:
+            return None
+        if incident.get("delivery", {}).get("status") == "Accepted":
+            return incident["delivery"]
+        cooldown = float(os.getenv("BREACH_PAGE_COOLDOWN_SECONDS", "600"))
+        last = self.store.get("page_state", "breach") or {}
+        if last.get("at") and time() - last["at"] < cooldown:
+            # Consecutive breaches inside the cooldown share one call.
+            delivery = {"mode": self.alert_dispatcher.mode, "status": "Suppressed", "attempts": 0,
+                        "reason": "Already paged for a recent breach", "previous_call": last.get("id"),
+                        "next_page_after": last["at"] + cooldown}
+            incident["timeline"].append(event("Page suppressed", "On-call was already called for a recent breach", "info"))
+            incident["delivery"] = delivery
+            self.store.put("incident", incident["id"], incident)
+            return delivery
+        try:
+            delivery = self.alert_dispatcher.dispatch(self.BREACH_PAGE_MESSAGE, incident["id"])
+            self.store.put("page_state", "breach", {"at": time(), "id": delivery.get("id"), "incident": incident["id"]})
+            incident["timeline"].append(event("Paged", "Voice call placed: breach detected", "warning"))
+        except AlertDispatchError as exc:
+            delivery = {"mode": self.alert_dispatcher.mode, "status": "Failed", "attempts": 1, "error": str(exc)}
+            incident["timeline"].append(event("Page failed", str(exc), "warning"))
+        incident["delivery"] = delivery
+        self.store.put("incident", incident["id"], incident)
+        return delivery
 
     def update_incident(self, iid, status):
         with self.lock:

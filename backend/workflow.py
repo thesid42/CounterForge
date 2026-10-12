@@ -1,3 +1,4 @@
+import logging
 import asyncio
 from copy import deepcopy
 from typing import TypedDict
@@ -346,6 +347,7 @@ def make_graph(service):
                 **completed,
                 "security_incident_id": alert["incident"]["id"],
                 "alert_action_id": alert["action"]["id"],
+                "page": alert.get("page"),
             }
             service.store.put("run", state["id"], completed)
         return completed
@@ -366,8 +368,16 @@ async def run_campaign(service, graph, state):
         result = await graph.ainvoke(state)
         service.store.put("run", state["id"], result)
     except Exception as exc:
+        logging.getLogger("counterforge").exception("lab run failed")
         latest = service.store.get("run", state["id"]) or state
-        service.store.put("run", state["id"], {**latest, "status": "failed", "stage": "error", "error": str(exc), "updated_at": now()})
+        failed = {**latest, "status": "failed", "stage": "error", "error": str(exc), "updated_at": now()}
+        try:
+            alert = service.record_lab_findings(failed)
+            if alert:
+                failed.update(security_incident_id=alert["incident"]["id"], alert_action_id=alert["action"]["id"], page=alert.get("page"))
+        except Exception:
+            logging.getLogger("counterforge").exception("breach page after failure")
+        service.store.put("run", state["id"], failed)
     await service.broker.publish(state["id"], {"type": "finished"})
 
 

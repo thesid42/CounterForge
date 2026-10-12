@@ -354,7 +354,8 @@ def test_twilio_dispatch_uses_allowlisted_config_and_sanitized_twiml():
     }
 
 
-def test_lab_finding_requires_operator_approval_before_live_dispatch():
+def test_lab_finding_requires_operator_approval_before_live_dispatch(monkeypatch):
+    monkeypatch.setenv("AUTO_PAGE_ON_BREACH", "false")
     class RecordingDispatcher:
         mode = "twilio_voice"
         def __init__(self):
@@ -608,3 +609,41 @@ def test_fixture_evolver_retargets_after_tool_block():
     assert nxt["mutation"] == "retarget_tool"
     assert nxt["tool"] in {"reveal_context", "export_incident"}
     assert nxt["payload"] != seed["payload"]
+
+
+def test_lab_breach_auto_pages_once(monkeypatch):
+    monkeypatch.setenv("AUTO_PAGE_ON_BREACH", "true")
+    class RecordingDispatcher:
+        mode = "twilio_voice"
+        def __init__(self):
+            self.calls = []
+        def dispatch(self, message, incident_id):
+            self.calls.append((message, incident_id))
+            return {"mode": self.mode, "status": "Accepted", "provider_status": "queued", "attempts": 1, "id": "CA-test"}
+    dispatcher = RecordingDispatcher()
+    service = LabService(Store(":memory:"), dispatcher)
+    run = {"id": "run-2", "results": [{"baseline": {"verdict": "succeeded"}}]}
+    finding = service.record_lab_findings(run)
+    assert dispatcher.calls == [("CounterForge alert. Breach detected. Check the CounterForge platform.", finding["incident"]["id"])]
+    assert finding["page"]["status"] == "Accepted"
+    service.record_lab_findings(run)
+    assert len(dispatcher.calls) == 1
+    assert service.record_lab_findings({"id": "run-3", "results": [{"baseline": {"verdict": "blocked"}}]}) is None
+
+
+def test_consecutive_breaches_page_once_within_cooldown(monkeypatch):
+    monkeypatch.setenv("AUTO_PAGE_ON_BREACH", "true")
+    monkeypatch.setenv("BREACH_PAGE_COOLDOWN_SECONDS", "600")
+    class D:
+        mode = "twilio_voice"
+        calls = 0
+        def dispatch(self, message, incident_id):
+            D.calls += 1
+            return {"mode": self.mode, "status": "Accepted", "attempts": 1, "id": f"CA{D.calls}"}
+    service = LabService(Store(":memory:"), D())
+    pages = [service.record_lab_findings({"id": f"r{i}", "results": [{"baseline": {"verdict": "succeeded"}}]})["page"] for i in range(3)]
+    assert D.calls == 1
+    assert [p["status"] for p in pages] == ["Accepted", "Suppressed", "Suppressed"]
+    monkeypatch.setenv("BREACH_PAGE_COOLDOWN_SECONDS", "0")
+    service.record_lab_findings({"id": "r9", "results": [{"baseline": {"verdict": "succeeded"}}]})
+    assert D.calls == 2
