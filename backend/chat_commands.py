@@ -21,8 +21,13 @@ def configuration_text(preferences, targets):
 
 def parse_command(text, preferences, targets):
     lower = text.lower().strip().rstrip(".!?")
+    # Common operator typos, scoped to command matching, never saved prose.
+    lower = re.sub(r"\bteh\b", "the", lower)
+    lower = re.sub(r"\bassitants?\b", "assistants", lower)
+    lower = re.sub(r"\bdefen[cs]e of(?=\s+(?:do|start|run|test|launch)\b)", "defense off", lower)
     prefix = r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+|i (?:want|would like) (?:you )?to\s+)?"
-    start = bool(re.match(prefix + r"(?:start|launch|run|test|evaluate)\b", lower))
+    launch = r"(?:(?:start|launch|run|test|evaluate)\b|(?:do|perform)\s+(?:(?:a|one|another|new)\s+){0,2}(?:security\s+)?(?:run|test)\b)"
+    start = bool(re.match(prefix + launch, lower) or re.match(prefix + r"(?:defen[cs]e(?: rules)? (?:on|off))\s*[,;]?\s*(?:and\s+)?" + launch, lower))
     configure = bool(re.match(prefix + r"(?:use|set|configure|switch|change|keep|make|enable|disable|allow|prevent|stop|turn)\b", lower) or re.match(r"^(?:defen[cs]e(?: rules)? (?:on|off)|(?:one|two|three|\d+) rounds?|brief replies|short replies)\b", lower))
     if re.match(r"^(?:show|what (?:are|is)|tell me|list)\b", lower) and re.search(r"\b(settings|configuration|config|personas|targets)\b", lower):
         return "settings", preferences

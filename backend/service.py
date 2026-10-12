@@ -240,7 +240,7 @@ class LabService:
 
     def new_session(self):
         sid = uuid4().hex
-        data = {"id": sid, "title": "New investigation", "created_at": now(), "messages": [], "events": [], "actions": [], "incident_id": "INC-104"}
+        data = {"id": sid, "title": "New chat", "created_at": now(), "console_messages": [], "console_run_id": None, "messages": [], "events": [], "actions": [], "incident_id": "INC-104"}
         self.store.put("session", sid, data)
         return data
 

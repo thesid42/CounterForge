@@ -622,6 +622,8 @@ pre {
   font-size: 11px;
 }
 .message.user .message-avatar {
+  order: -1;
+  align-self: flex-start;
   border-radius: 50%;
   border: 1px solid #4c5460;
   background: #343a44;

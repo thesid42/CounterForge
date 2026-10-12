@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .fixtures import INCIDENTS
 from .config import settings
-from .console import ConsoleRequest, WorkspaceConsole, assistant_config, run_summary
+from .console import ConsoleRequest, RunContextRequest, ResumeRunRequest, WorkspaceConsole, assistant_config, run_summary
 from .models import ApprovalRequest, ChatRequest, LabRequest
 from .roles import live_lab_ready, role_models_configured
 from .service import LabService
@@ -31,6 +31,7 @@ def create_app(service=None):
             state = {**pending[0], "status": "running"}
             service.store.put("run", state["id"], state)
             await run_campaign(service, graph, state)
+            await console.publish_run_completion(state["id"])
             agent = service.store.get("agent", state.get("target", {}).get("id", "")) if state.get("target") else None
             if agent:
                 result = service.store.get("run", state["id"])
@@ -47,6 +48,8 @@ def create_app(service=None):
         for run in service.store.list("run"):
             if run["status"] == "running":
                 service.store.put("run", run["id"], {**run, "status": "failed", "stage": "error", "error": "Backend restarted during evaluation"})
+        for session in service.store.list("session"):
+            await console.sync_run_updates(session["id"])
         schedule()
         yield
         for task in tasks:
@@ -109,6 +112,13 @@ def create_app(service=None):
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/sessions/{sid}/context")
+    async def select_chat_run(sid: str, payload: RunContextRequest):
+        try:
+            return await console.select_run(sid, payload.run_id, payload.watch)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.middleware("http")
     async def local_origin(request: Request, call_next):
@@ -174,8 +184,11 @@ def create_app(service=None):
         return service.new_session()
 
     @app.get("/api/sessions/{sid}")
-    def session(sid: str):
-        return guarded(service.session, sid)
+    async def session(sid: str):
+        try:
+            return await console.sync_run_updates(sid)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/sessions/{sid}/chat")
     async def chat(sid: str, payload: ChatRequest):
@@ -205,6 +218,13 @@ def create_app(service=None):
             raise HTTPException(404, "Run not found")
         return value
 
+    @app.post("/api/lab/runs/{rid}/chat")
+    async def resume_run_chat(rid: str, payload: ResumeRunRequest):
+        try:
+            return await console.resume_run_chat(rid, payload.session_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
     @app.post("/api/defenses/activate/{rid}")
     def activate(rid: str):
         return guarded(service.activate, rid)
@@ -223,8 +243,9 @@ def create_app(service=None):
         if format == "json":
             return value
         action = service.store.get("action", value.get("alert_action_id", ""))
-        if action and action.get("delivery", {}).get("mode") == "twilio_voice":
-            status = action["delivery"]["status"]
+        delivery = value.get("page") or (action or {}).get("delivery", {})
+        if delivery.get("mode") == "twilio_voice":
+            status = delivery["status"]
             alert_note = f"Twilio alert request: {status}."
             if status == "Accepted":
                 alert_note += " Provider acceptance does not prove the responder answered."

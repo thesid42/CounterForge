@@ -2,19 +2,20 @@
 
 An incident-response assistant and agent-defense lab for CrowdStrike Track 3. Investigate a synthetic incident, catch a poisoned runbook attempting an unauthorized export, and replay attacks against a versioned tool policy. CounterForge builds on [Redforge](https://github.com/thesid42/Redforge); the reuse map is in [PROVENANCE.md](PROVENANCE.md).
 
-**Current build: executable local demo plus an optional adaptive model lab.** Demo mode uses deterministic fixtures. Live mode can use OpenRouter-backed attacker and defender roles against the localhost-only DVAA/Ollama target. Alerts remain operator-approved and are simulated unless `ALERT_MODE=twilio_voice` is explicitly configured.
+**Current build: executable local demo plus an optional adaptive model lab.** Demo mode uses deterministic fixtures. Live mode can use OpenRouter-backed attacker and defender roles against localhost persona targets or the legacy DVAA/Ollama target. Breach alerts are automatic by default, with a cooldown, and are simulated unless `ALERT_MODE=twilio_voice` is configured.
 
-![CounterForge workspace, implemented local demo](design/counterforge-live-workspace.jpg)
+![Ask CounterForge with a fresh chat and no run selected](design/counterforge-chat.jpg)
 
 ## What works
 
-- Incident chat with persistent conversations, synthetic runbooks, draft updates, and a security timeline.
+- One CounterForge chat with persistent conversations, text configuration, security-test launches, and explanations of saved evidence.
+- A simplified Workspace with chat, readable run names, and a run activity list that opens detailed results in Attack Lab. Configure and launch bounded tests through text; the evidence analyst explains results in plain language.
 - Four bounded attack objectives: runbook injection, tool-result injection, operator impersonation, and protected-context extraction. In adaptive mode, an attacker model creates new prompts over multiple rounds using redacted observations of the local target's behavior.
 - A LangGraph workflow: generate → execute → inspect → propose → replay. Persona agents receive the defender's rules before replay, with tool checks applied before execution. The UI distinguishes unsafe model replies from actions stopped by enforcement.
 - Incident, support, and knowledge-assistant personas with different tools. Registering a target queues an autonomous security loop by default; manual start is also available. Later attempts use baseline and replay feedback plus strategies from earlier runs.
 - The same payload and actual redacted target responses shown side by side, with defense rules on or off. Autonomous validation covers recorded attacks and one legitimate persona task; it is not a held-out robustness score.
 - Operator activation of validated policies, stale-candidate rejection, rollback, and monotonic policy versions.
-- Action-bound paging approvals with expiry, recipient allowlisting, duplicate suppression, and rate limiting. Notifications are simulated by default or sent as sanitized Twilio voice calls when explicitly configured; acknowledgment and resolution remain operator actions.
+- Automatic breach paging with a fixed sanitized message and a cooldown between calls. Manual paging retains action-bound approval, expiry, recipient allowlisting, and duplicate suppression. Notifications are simulated by default or sent as Twilio voice calls when configured; acknowledgment and resolution remain operator actions.
 - Markdown/JSON reports, SQLite persistence, scoped SSE events, and a React interface with six views.
 
 ## Run locally
@@ -62,24 +63,46 @@ ADAPTIVE_ATTACK_ROUNDS=2
 
 In **Attack lab**, choose a persona target and the visible **Defense rules** toggle. Expand **Register new agent** to set a local model, persona, and endpoint. Leave automatic evaluation enabled to queue the attack/defense loop on registration, or disable it and use **Run test** later. New registrations wait for the current run; registering the identical target again does not duplicate its run. **Advanced options** controls the one-to-three attempt limit. Rules-off runs repeat each payload without the proposed defense, while rules-on runs compare an unprotected baseline with a protected replay.
 
-Workspace contains chat and a run activity list. Click a readable run name to open its Attack Lab results; graphs, model labels, headline metrics, and the separate run inspector are removed. The analyst answers in one or two short sentences by default; ask for details when needed. Chat inputs clear on send and recover the draft if the request fails.
+## Workspace chat
 
-Configure chat runs through text, for example: **Use the support assistant, defense off, one round, context check.** Then say **Start a new run**, or combine them: **Run the knowledge assistant with defense on, one round, context check.** Supported personas are incident, support, and knowledge/research; test surfaces include runbook, tool-result, authority, context, and all surfaces. Preferences persist per conversation. **Show settings**, **keep replies brief**, **use detailed replies**, **disable chat runs**, and **enable chat runs** control the assistant. Attack Lab retains its selectors and toggles. Only direct operator commands launch a bounded run; saved evidence and analyst output cannot launch one.
+**Ask CounterForge** is the only Workspace chat. There is no separate incident demo chat or analyst label. Each new chat starts with **No run selected**. Select a readable name such as **Support · Context check 13** in **Run activity** to load its saved conversation, including its launch, follow-up questions, and automatic summary. Selecting another run switches to that run's conversation. Return to a running test to see its live progress and eventual summary; switching away does not stop it. Click the selected run again, or use **Clear selected run** beside the composer, to unselect it. The arrow beside each run opens its payloads, target responses, and advanced results in Attack Lab. **Continue in chat** returns to that run's conversation. Opening Attack Lab does not change the chat's selection.
+
+Run selection belongs to each conversation and survives switching chats or reloading the page. Starting a test selects the newly created run. An unselected chat never silently uses the latest saved run; explicitly ask about the latest run or recent comparisons to access that evidence. User messages and their person icons sit on the right; CounterForge replies sit on the left. The input clears immediately on send; a failed request restores the draft without overwriting a newer draft.
+
+Runs started from chat, Attack Lab, or agent registration post a short completion summary to the originating conversation automatically. The summary describes the attack methods, observed leaks or unauthorized actions, the defense comparison when available, and alert delivery. Progress appears while a watched run is active. Failed or incomplete checks are identified, and each completion is saved once, including after reconnecting or reloading. You do not need to ask for status, and clearing a selection does not reattach it when a summary arrives. Summaries use recorded results and remain available without an analyst provider connection.
+
+Configure chat runs through text. Selectors, toggles, and advanced controls remain in Attack Lab. Chat preferences persist per conversation.
+
+| Say this in chat | Result |
+| --- | --- |
+| Use the support assistant, defense off, one round, context check. | Save the setup without starting a run. |
+| Start a new run. | Launch a test with the saved setup. |
+| Run the knowledge assistant with defense on, one round, context check. | Configure and launch a test in one message. |
+| Show settings. | Show the current chat setup. |
+| Disable chat runs. / Enable chat runs. | Pause or allow launches from this conversation. Attack Lab remains available. |
+| What happened in this run? | Explain the selected run; if none is selected, ask you to choose one. |
+| Explain the latest run. | Explicitly select and explain the latest saved run. |
+| Give details comparing the six latest checks. | Compare the six most recent saved runs using their recorded evidence. |
+| Keep replies brief. / Use detailed replies. | Set the preferred explanation length. |
+
+Supported personas are incident, support, and knowledge/research. Test surfaces include runbook, tool-result, authority, context, and all surfaces. Runs are limited to one through three rounds. Direct run and configuration commands are parsed by the server; saved evidence and analyst output cannot launch a run or change settings.
+
+The evidence analyst uses a fixed system prompt in `backend/console.py` for consistent, everyday language. Replies use one or two short sentences by default; ask for details for a longer explanation. It describes what the attack tried, what the target did, and whether defense changed the outcome when relevant. For example, it says “revealed the test secret” instead of “leaked the synthetic canary,” and distinguishes a target refusing a request from a defense blocking its tool. New and displayed historical replies have em dashes and en dashes removed. The analyst uses saved evidence and cannot claim overall safety from a successful recorded test.
 
 ## Demo walkthrough
 
-1. Open **Incident demo** from **Workspace**, enable **Use injected runbook**, then click **Investigate the outage**. The legitimate response remains useful; the security timeline shows the denied export.
-2. Click **Review action**, inspect the recipient, exact text, expiry, and policy version, then **Approve simulation**.
-3. In **Incidents**, acknowledge the simulated page and resolve the incident. No external call occurs.
-4. In **Attack lab**, choose a target and attack surface, then **Run test**. Select an attack to see its payload and both responses; expand **View full execution traces** for the evidence. **Advanced options** contains attempt limits and saved-defense controls.
+1. Start a **New chat** in Workspace. Configure a short test, for example **Use the support assistant, defense off, one round, context check.** Then say **Start a new run**.
+2. The newly created run becomes the chat's selection. A short attack summary appears automatically when it completes. Ask follow-up questions for more detail, or clear the selection to return to a general conversation.
+3. Use the run's arrow in **Run activity** to open **Attack lab**. Choose a target, attack surface, and **Defense rules** setting, then **Run test**. Select an attack to see its payload and both responses; expand **View full execution traces** for the evidence. **Advanced options** contains attempt limits and saved-defense controls.
+4. Ask CounterForge to compare recent runs, or select a particular run to discuss its evidence. A defense is credited only when that run's own unprotected attempt breached and the same payload with defense did not.
 5. Choose **Review defense**, then **Activate policy** when the recorded checks pass. Inspect **Defenses**; rollback remains available. Older DVAA runs without an applied defense are labeled as repeated probes and cannot be activated.
-6. Download the Markdown or JSON evidence from **Reports**.
+6. Review any generated security incident and alert delivery in **Incidents**. Acknowledgment and resolution remain operator actions. Download Markdown or JSON evidence from **Reports**.
 
 ## Optional Twilio voice alerts
 
 Copy `.env.example` to `.env`, set `ALERT_MODE=twilio_voice`, and provide the Account SID (`TWILIO_ACCOUNT_SID`, beginning with `AC`), API Key SID (`TWILIO_API_KEY_SID`, beginning with `SK`), `TWILIO_API_KEY_SECRET`, `TWILIO_FROM_NUMBER`, and `ALERT_TO_NUMBER`. `TWILIO_AUTH_TOKEN` is supported as a local fallback when API-key credentials are not configured. Phone numbers must use E.164 format, such as `+14155550123`. Keep `.env` private; it is ignored by Git.
 
-When a blocked Workspace action or a confirmed vulnerable Attack Lab baseline creates an incident, CounterForge prepares one deduplicated alert. It does not call automatically. The operator must review the exact sanitized message and choose **Approve call**. The model cannot select the recipient, access credentials, or approve its own alert. Provider failures are recorded on the incident without weakening containment.
+When an Attack Lab run records a breach, the server automatically sends the fixed message “CounterForge alert. Breach detected. Check the CounterForge platform.” to the configured on-call number. `AUTO_PAGE_ON_BREACH=true` enables this behavior by default; set it to `false` to use manual review and **Approve call** instead. `BREACH_PAGE_COOLDOWN_SECONDS=600` suppresses consecutive breach calls for ten minutes. Twilio speech pauses briefly and repeats the alert once. The model cannot choose the recipient, change the alert message, or access credentials. Provider failures and cooldown suppression are recorded on the incident and run.
 
 Twilio trial accounts may require the destination to be verified. An `Accepted` result means Twilio accepted the API request; it does not prove a person answered. Start the application normally after saving `.env`.
 
@@ -91,7 +114,7 @@ Twilio trial accounts may require the destination to be verified. An `Accepted` 
 npm --prefix frontend run build
 ```
 
-Tests cover observable fixture breaches, protected output, useful incident responses, adapter history isolation, approval expiry and payload validation, concurrent/duplicate dispatch, policy replay and rollback, reports, cross-site mutation rejection, and bounded event queues. CI runs the backend tests and frontend build on pushes and pull requests.
+Tests cover observable fixture breaches, protected output, useful incident responses, adapter history isolation, approval expiry and payload validation, automatic breach paging and cooldowns, policy replay and rollback, reports, cross-site mutation rejection, and bounded event queues. Workspace checks cover text configuration, bounded launches, explicit run selection and clearing, conversation isolation, automatic completion summaries and reconnect deduplication, readable run names, and the analyst's plain-language prompt and punctuation rule. Autonomous checks cover persona tools, defense enforcement before execution, feedback, and registration queues. The current repository has no CI workflow; run the commands above locally.
 
 ## Integration boundaries
 

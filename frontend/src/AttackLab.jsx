@@ -78,6 +78,7 @@ export default function AttackLab({
   busy,
   startRun,
   openRun,
+  resumeRunChat,
   clearDefense,
   activate,
   viewRule,
@@ -390,6 +391,9 @@ export default function AttackLab({
               </li>
             ))}
           </ol>
+          <button className="button" onClick={() => resumeRunChat(run.id)}>
+            Continue in chat
+          </button>
         </section>
       )}
       {run?.status === "failed" && (
@@ -417,7 +421,28 @@ export default function AttackLab({
               </p>
             </div>
             <span className="al-run-id">{runLabel(run)}</span>
+            <button
+              className="button"
+              onClick={() => resumeRunChat(run.id)}
+              disabled={busy}
+            >
+              Continue in chat
+            </button>
           </div>
+          {run?.page && (
+            <p className="al-limitation" role="status">
+              {run.page.mode === "simulated"
+                ? "Simulated alert"
+                : "Voice alert"}
+              :{" "}
+              {run.page.status === "Accepted"
+                ? "accepted"
+                : run.page.status === "Suppressed"
+                  ? "suppressed by the recent-page cooldown"
+                  : "failed"}
+              .
+            </p>
+          )}
           {legacyLive && (
             <p className="al-limitation">
               DVAA replay does not verify an applied model defense. Historical

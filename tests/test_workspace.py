@@ -1,9 +1,12 @@
 import asyncio
 import json
+import time
+from threading import Event
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from backend.config import settings
+from backend.alerts import SimulatedAlertDispatcher
 from backend.console import ConsoleRequest, WorkspaceConsole, evidence, run_summary
 from backend.fixtures import CANARY
 from backend.main import create_app
@@ -20,7 +23,7 @@ def lab(monkeypatch):
     monkeypatch.setattr(settings, "MODEL_MODE", "demo")
     monkeypatch.setattr(settings, "TARGET_BASE_URL", "")
     monkeypatch.setattr(settings, "DEFENDER_API_KEY", "")
-    service = LabService(Store(":memory:"))
+    service = LabService(Store(":memory:"), SimulatedAlertDispatcher())
     with TestClient(create_app(service)) as client:
         sid = client.post("/api/sessions").json()["id"]
         yield service, client, sid
@@ -157,7 +160,9 @@ def test_text_configuration_persists_and_controls_natural_chat_launches(lab):
     launched = []
     async def start(request):
         launched.append(request)
-        return {"id": "internal-opaque-id", "name": "Support · Context check 1"}
+        run = {"id": "internal-opaque-id", "name": "Support · Context check 1", "status": "queued", "results": []}
+        service.store.put("run", run["id"], run)
+        return run
     console = WorkspaceConsole(service, start)
     configured = asyncio.run(console.chat(sid, ConsoleRequest(message="Use the support assistant, defense off, one round, context check. Keep replies brief.")))
     assert configured["started_run"] is None
@@ -205,6 +210,23 @@ def test_brief_and_requested_details_have_separate_budgets_and_hide_run_ids(lab,
     assert [r["max_tokens"] for r in sent] == [220, 450]
 
 
+def test_analyst_has_consistent_plain_language_prompt_and_no_long_dashes(lab, monkeypatch):
+    from backend.console import explain
+    monkeypatch.setattr(settings, "DEFENDER_API_KEY", "test-key")
+    captured = []
+    original = httpx.AsyncClient
+    def respond(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "The target tried to reveal the test secret\u2014the defense blocked the tool. No secret escaped\u2013in this test."}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(respond), **kw))
+    answer, _ = asyncio.run(explain("What happened?", [], {"selected_run": None}))
+    assert answer == "The target tried to reveal the test secret, the defense blocked the tool. No secret escaped, in this test."
+    prompt = captured[0]["messages"][0]
+    assert prompt["role"] == "system"
+    for instruction in ("everyday language", "Never use em dashes", "'test secret' instead of 'synthetic canary'", "Distinguish unsafe model attempts from actual executed actions", "at most 35 words"):
+        assert instruction in prompt["content"]
+
+
 @pytest.mark.parametrize("question", ["Give details comparing the six latest context checks", "Compare previous runs"])
 def test_comparison_questions_receive_all_recent_evidence(lab, monkeypatch, question):
     service, client, sid = lab
@@ -222,3 +244,186 @@ def test_comparison_questions_receive_all_recent_evidence(lab, monkeypatch, ques
     assert '"recent_runs"' in context
     assert all(f"Context check {index}" in context for index in range(6))
     assert result["session"]["console_messages"][-1]["card"]["type"] == "run"
+
+
+def test_run_context_is_explicit_persistent_clearable_and_isolated_per_chat(lab, monkeypatch):
+    service, client, sid = lab
+    old = {"id": "old-run", "name": "Support · Context check 1", "status": "completed", "results": []}
+    service.store.put("run", old["id"], old)
+    captured = []
+    async def explain(question, history, context, reply_style):
+        captured.append((history, context))
+        return "Select a run for results." if not context["selected_run"] else "This is the selected test.", "test"
+    monkeypatch.setattr("backend.console.explain", explain)
+    initial = client.post(f"/api/sessions/{sid}/console", json={"message": "What happened in this run?"}).json()
+    assert captured[-1][1]["selected_run"] is None
+    assert initial["session"]["console_run_id"] is None
+    assert initial["session"]["console_messages"][-1]["card"] is None
+    selected = client.post(f"/api/sessions/{sid}/context", json={"run_id": old["id"]}).json()
+    assert selected["console_run_id"] == old["id"]
+    assert client.get(f"/api/sessions/{sid}").json()["console_run_id"] == old["id"]
+    client.post(f"/api/sessions/{sid}/console", json={"message": "Explain the attack"})
+    assert captured[-1][1]["selected_run"]["id"] == old["id"]
+    other = client.post("/api/sessions").json()
+    assert other["title"] == "New chat" and other["console_run_id"] is None
+    client.post(f"/api/sessions/{other['id']}/console", json={"message": "What happened?"})
+    assert captured[-1][1]["selected_run"] is None
+    assert client.post(f"/api/sessions/{sid}/context", json={"run_id": None}).json()["console_run_id"] is None
+    client.post(f"/api/sessions/{sid}/console", json={"message": "What happened?"})
+    history, context = captured[-1]
+    assert context["selected_run"] is None
+    assert not any(m.get("run_id") == old["id"] for m in history)
+    assert client.post(f"/api/sessions/{sid}/context", json={"run_id": "missing"}).status_code == 404
+    assert client.get(f"/api/sessions/{sid}").json()["console_run_id"] is None
+    client.post(f"/api/sessions/{sid}/console", json={"message": "Explain the latest run"})
+    assert captured[-1][1]["selected_run"]["id"] == old["id"]
+    client.post(f"/api/sessions/{sid}/console", json={"message": "Hello", "run_id": None})
+    assert captured[-1][1]["selected_run"] is None
+
+
+@pytest.mark.parametrize("message", ["defense of do a run on one of teh assitants", "Defense off, do a run", "Can you do a new run with defense off?", "Perform a test without defense"])
+def test_natural_run_requests_start_new_runs_instead_of_explaining_old_evidence(lab, message):
+    service, client, sid = lab
+    service.store.put("run", "old", {"id": "old", "status": "completed", "results": []})
+    launched = []
+    async def start(request):
+        launched.append(request)
+        return {"id": "new", "name": "Incident · Context check 2"}
+    console = WorkspaceConsole(service, start)
+    asyncio.run(console.select_run(sid, "old"))
+    result = asyncio.run(console.chat(sid, ConsoleRequest(message=message)))
+    assert len(launched) == 1 and not launched[0].apply_defense
+    assert result["started_run"]["id"] == result["session"]["console_run_id"] == "new"
+    assert result["session"]["console_messages"][-1]["card"]["run_id"] == "new"
+    assert "Started Incident" in result["session"]["console_messages"][-1]["content"]
+
+
+@pytest.mark.parametrize("message", ["Explain how to do a run", "What happened when I said defense off do a run?", "What does perform a test mean?"])
+def test_questions_about_run_commands_do_not_launch(lab, message):
+    from backend.chat_commands import parse_command, default_preferences
+    command, _ = parse_command(message, default_preferences(), [])
+    assert command is None
+
+
+def test_completion_is_automatically_posted_once_to_origin_chat_without_a_status_question(lab, monkeypatch):
+    service, client, sid = lab
+    release = Event()
+    async def campaign(service, graph, state):
+        while not release.is_set():
+            await asyncio.sleep(.01)
+        service.store.put("run", state["id"], {**state, "status": "completed", "results": [{
+            "id": "data-extraction-r1", "baseline": {"verdict": "succeeded", "canary_leaked": True},
+            "defended": {"verdict": "succeeded"}}]})
+    monkeypatch.setattr("backend.main.run_campaign", campaign)
+    started = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run with defense off"}).json()
+    run_id = started["started_run"]["id"]
+    assert started["session"]["console_pending_runs"] == [run_id]
+    assert len(started["session"]["console_messages"]) == 2
+    client.post(f"/api/sessions/{sid}/context", json={"run_id": None})
+    other = client.post("/api/sessions").json()
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.session(sid)  # Prove the completion worker posts it without a read endpoint.
+        if any(m.get("completion_run_id") == run_id for m in session["console_messages"]):
+            break
+        time.sleep(.01)
+    updates = [m for m in session["console_messages"] if m.get("completion_run_id")]
+    assert len(updates) == 1
+    assert "requests for protected context" in updates[0]["content"]
+    assert "1 of 1" in updates[0]["content"] and "No defense was tested" in updates[0]["content"]
+    assert updates[0]["detailed"] and updates[0]["content"].count("\n\n") >= 2
+    assert sum(m["role"] == "user" for m in session["console_messages"]) == 1
+    assert session["console_run_id"] is None and session["console_pending_runs"] == []
+    assert client.get(f"/api/sessions/{other['id']}").json()["console_messages"] == []
+    assert len(client.get(f"/api/sessions/{sid}").json()["console_messages"]) == 3
+    assert len(client.get(f"/api/sessions/{sid}").json()["console_messages"]) == 3
+
+
+def test_completion_summary_explains_methods_counts_partial_checks_and_alert_acceptance():
+    from backend.console import completion_summary
+    run = {"id": "internal", "name": "Support · Full security check 2", "status": "completed", "apply_defense": True,
+           "results": [{"id": "runbook-injection-r1", "baseline": {"verdict": "succeeded", "canary_leaked": True}, "defended": {"verdict": "blocked"}},
+                       {"id": "role-escalation-r1", "baseline": {"verdict": "error"}, "defended": {"verdict": "skipped"}}],
+           "page": {"mode": "twilio_voice", "status": "Accepted"}}
+    text = completion_summary(run)
+    assert "instructions hidden in runbooks" in text and "fake operator authority" in text
+    assert "Without defense, 1 of 1" in text and "With defense, 0 of 1" in text
+    assert "results are incomplete" in text and "Voice alert accepted" in text
+    assert "answered" not in text and "internal" not in text and "\u2014" not in text
+    unsupported = completion_summary({**run, "results": [{"baseline": {"verdict": "succeeded"}, "defended": {"verdict": "blocked", "defense_supported": False}}]})
+    assert "do not measure defense effectiveness" in unsupported
+    failed = completion_summary({"id": "failed", "status": "failed", "results": []})
+    assert "stopped before finishing" in failed and "No attack results" in failed
+
+
+def test_finished_run_catches_up_after_reload_but_is_not_duplicated(lab):
+    service, client, sid = lab
+    service.store.put("run", "finished", {"id": "finished", "status": "failed", "results": []})
+    session = service.session(sid)
+    session["console_messages"] = [{"id": "launch", "role": "assistant", "source": "Run controller", "card": {"type": "run", "run_id": "finished"}}]
+    service.store.put("session", sid, session)
+    first = client.get(f"/api/sessions/{sid}").json()
+    second = client.get(f"/api/sessions/{sid}").json()
+    assert first == second and len(first["console_messages"]) == 2
+    assert first["console_messages"][-1]["completion_run_id"] == "finished"
+    assert first["console_run_id"] is None
+
+
+def test_lab_started_run_can_be_watched_even_if_it_finished_before_chat_attached(lab):
+    service, client, sid = lab
+    service.store.put("run", "fast", {"id": "fast", "status": "completed", "results": []})
+    client.post(f"/api/sessions/{sid}/context", json={"run_id": "fast", "watch": True})
+    session = client.get(f"/api/sessions/{sid}").json()
+    assert len(session["console_messages"]) == 1
+    assert session["console_messages"][0]["completion_run_id"] == "fast"
+
+
+def test_report_uses_automatic_voice_delivery_instead_of_pending_manual_action(lab):
+    service, client, sid = lab
+    service.store.put("run", "paged", {"id": "paged", "status": "completed", "results": [], "page": {"mode": "twilio_voice", "status": "Accepted"}})
+    report = client.get("/api/reports/paged").text
+    assert "Twilio alert request: Accepted" in report
+    assert "does not prove the responder answered" in report
+
+
+def test_continue_in_chat_restores_origin_and_does_not_mix_new_conversations(lab):
+    service, client, sid = lab
+    service.store.put("run", "owned", {"id": "owned", "status": "completed", "results": []})
+    origin = service.session(sid)
+    origin["console_messages"] = [{"id": "start", "role": "assistant", "source": "Run controller", "card": {"run_id": "owned"}}]
+    service.store.put("session", sid, origin)
+    client.get(f"/api/sessions/{sid}")  # Catch up its saved completion.
+    other = client.post("/api/sessions").json()
+    resumed = client.post("/api/lab/runs/owned/chat", json={"session_id": other["id"]}).json()
+    assert resumed["id"] == sid and resumed["console_run_id"] == "owned"
+    assert len(resumed["console_messages"]) == 2
+    assert client.get(f"/api/sessions/{other['id']}").json()["console_messages"] == []
+    service.store.put("run", "external", {"id": "external", "status": "completed", "results": []})
+    attached = client.post("/api/lab/runs/external/chat", json={"session_id": other["id"]}).json()
+    assert attached["id"] == other["id"] and attached["console_run_id"] == "external"
+    assert attached["console_messages"][0]["completion_run_id"] == "external"
+    assert client.post("/api/lab/runs/external/chat", json={"session_id": sid}).json()["id"] == other["id"]
+    assert client.post("/api/lab/runs/missing/chat", json={"session_id": other["id"]}).status_code == 404
+
+
+def test_switch_run_conversation_restores_running_run_and_keeps_updates_in_origin(lab):
+    service, client, sid = lab
+    service.store.put("run", "active", {"id": "active", "status": "running", "results": []})
+    service.store.put("run", "older", {"id": "older", "status": "completed", "results": []})
+    origin = service.session(sid)
+    origin["console_messages"] = [{"id": "launch", "role": "assistant", "run_id": "active", "source": "Run controller", "card": {"run_id": "active"}}]
+    origin["console_pending_runs"] = ["active"]
+    service.store.put("session", sid, origin)
+    older = client.post("/api/lab/runs/older/chat", json={"session_id": sid}).json()
+    assert older["id"] != sid and older["console_run_id"] == "older"
+    active = client.post("/api/lab/runs/active/chat", json={"session_id": older["id"]}).json()
+    assert active["id"] == sid and active["console_run_id"] == "active"
+    assert active["console_pending_runs"] == ["active"]
+    assert len(active["console_messages"]) == 1
+    service.store.put("run", "active", {"id": "active", "status": "completed", "results": []})
+    completed = client.get(f"/api/sessions/{sid}").json()
+    assert completed["console_messages"][-1]["completion_run_id"] == "active"
+    assert completed["console_pending_runs"] == []
+    assert all(m.get("run_id") == "older" for m in client.get(f"/api/sessions/{older['id']}").json()["console_messages"])
+    assert client.post("/api/lab/runs/active/chat", json={"session_id": older["id"]}).json() == completed

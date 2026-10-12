@@ -8,6 +8,7 @@ import {
   Send,
   Sparkles,
   TriangleAlert,
+  UserRound,
   X,
 } from "lucide-react";
 import { runLabel } from "./runNames";
@@ -53,37 +54,49 @@ async function api(path, body) {
   return value;
 }
 
-function RunList({ runs, selectedId, open }) {
+function RunList({ runs, selectedId, select, open, disabled }) {
   return (
     <div className="cf-recent">
       {runs.map((r) => (
-        <button
+        <div
           key={r.id}
-          className={selectedId === r.id ? "selected" : ""}
-          onClick={() => open(r.id)}
-          aria-label={`Open ${runLabel(r)} in Attack Lab`}
+          className={"cf-run-row " + (selectedId === r.id ? "selected" : "")}
         >
-          <span className={`cf-run-dot ${r.status}`} />
-          <div>
-            <strong>{runLabel(r)}</strong>
-            <small>
-              {date(r.created_at)} · Defense{" "}
-              {r.apply_defense === false ? "off" : "on"}
-            </small>
-            <small>
-              {["queued", "running"].includes(r.status)
-                ? stageLabels[r.stage] || "In progress"
-                : r.status === "failed"
-                  ? "Failed"
-                  : "Completed"}
-            </small>
-          </div>
-          {["queued", "running"].includes(r.status) ? (
-            <Loader2 size={14} className="spin" />
-          ) : (
+          <button
+            className="cf-select-run"
+            disabled={disabled}
+            aria-label={`${selectedId === r.id ? "Unselect" : "Select"} ${runLabel(r)} for chat`}
+            aria-pressed={selectedId === r.id}
+            onClick={() => select(selectedId === r.id ? null : r.id)}
+          >
+            <span className={`cf-run-dot ${r.status}`} />
+            <div>
+              <strong>{runLabel(r)}</strong>
+              <small>
+                {date(r.created_at)} · Defense{" "}
+                {r.apply_defense === false ? "off" : "on"}
+              </small>
+              <small>
+                {["queued", "running"].includes(r.status)
+                  ? stageLabels[r.stage] || "In progress"
+                  : r.status === "failed"
+                    ? "Failed"
+                    : "Completed"}
+              </small>
+            </div>
+            {["queued", "running"].includes(r.status) ? (
+              <Loader2 size={14} className="spin" />
+            ) : null}
+          </button>
+          <button
+            className="cf-open-run"
+            aria-label={`Open ${runLabel(r)} in Attack Lab`}
+            onClick={() => open(r.id)}
+            disabled={disabled}
+          >
             <ArrowRight size={14} />
-          )}
-        </button>
+          </button>
+        </div>
       ))}
     </div>
   );
@@ -91,12 +104,17 @@ function RunList({ runs, selectedId, open }) {
 
 function MessageContent({ content, role, detailed }) {
   const [expanded, setExpanded] = useState(!!detailed);
-  const words = content.split(/\s+/);
+  // Apply the punctuation rule to saved replies as well as new ones.
+  const display =
+    role === "assistant"
+      ? content.replace(/\s*[\u2013\u2014]+\s*/g, ", ")
+      : content;
+  const words = display.split(/\s+/);
   const long = role === "assistant" && words.length > 45;
   return (
     <>
       <div className="cf-message-content">
-        {long && !expanded ? words.slice(0, 40).join(" ") + "…" : content}
+        {long && !expanded ? words.slice(0, 40).join(" ") + "…" : display}
       </div>
       {long && (
         <button
@@ -119,7 +137,7 @@ export default function Workspace({
   refresh,
   newChat,
   openLab,
-  openIncidentDemo,
+  resumeRunChat,
 }) {
   const [workspace, setWorkspace] = useState(null);
   const [message, setMessage] = useState("");
@@ -127,6 +145,9 @@ export default function Workspace({
   const [error, setError] = useState("");
   const [optimistic, setOptimistic] = useState("");
   const bottom = useRef(null);
+  const requestVersion = useRef(0);
+  const busyRef = useRef(false);
+  busyRef.current = busy;
   useEffect(() => {
     let disposed = false;
     const load = async () => {
@@ -145,12 +166,63 @@ export default function Workspace({
     };
   }, [overview, run?.stage]);
   useEffect(() => {
+    if (!session?.id) return;
+    const sid = session.id;
+    let disposed = false;
+    let loading = false;
+    const load = async () => {
+      if (loading || busyRef.current) return;
+      loading = true;
+      const version = requestVersion.current;
+      try {
+        const next = await api("/sessions/" + sid);
+        if (!disposed && !busyRef.current && version === requestVersion.current)
+          setSession((current) => (current?.id === sid ? next : current));
+      } catch (e) {
+        if (!disposed) setError(e.message);
+      } finally {
+        loading = false;
+      }
+    };
+    const events = new EventSource("/api/events/" + sid);
+    events.onmessage = load;
+    load();
+    const timer = setInterval(load, 3000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      events.close();
+    };
+  }, [session?.id, setSession]);
+  useEffect(() => {
     bottom.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [session?.console_messages?.length, busy]);
-  useEffect(() => setMessage(""), [session?.id]);
+  }, [session?.id, session?.console_run_id, session?.console_messages?.length, busy]);
+  useEffect(() => {
+    setMessage("");
+    setError("");
+  }, [session?.id]);
   const runs = workspace?.runs || [];
+  const selectedId = session?.console_run_id || null;
+  const selectedRun = runs.find((r) => r.id === selectedId);
   const preferences = session?.console_config;
-  const messages = session?.console_messages || [];
+  const messages = (session?.console_messages || []).filter(
+    (m) => !selectedId ||
+      (m.run_id || m.completion_run_id || m.card?.run_id) === selectedId,
+  );
+  async function selectRun(id) {
+    if (busy || !session) return;
+    requestVersion.current += 1;
+    setBusy(true);
+    setError("");
+    try {
+      if (id) await resumeRunChat(id);
+      else setSession(await api("/sessions/" + session.id + "/context", { run_id: null }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
   async function open(id) {
     try {
       setError("");
@@ -163,6 +235,7 @@ export default function Workspace({
   }
   async function send(text = message) {
     if (busy || !session || !text.trim()) return;
+    requestVersion.current += 1;
     const draft = text.trim();
     setBusy(true);
     setError("");
@@ -171,7 +244,7 @@ export default function Workspace({
     try {
       const result = await api("/sessions/" + session.id + "/console", {
         message: draft,
-        run_id: run?.id || null,
+        run_id: selectedId,
       });
       setSession(result.session);
       setOptimistic("");
@@ -205,15 +278,24 @@ export default function Workspace({
             <Sparkles size={14} /> SECURITY LAB WORKSPACE
           </div>
           <h1>
-            Your lab. In conversation<span className="title-dot">.</span>
+            Ask CounterForge<span className="title-dot">.</span>
           </h1>
           <p>Ask a question, configure a test, or start a run.</p>
         </div>
         <div className="cf-heading-actions">
-          <button className="cf-text-button" onClick={openIncidentDemo}>
-            Incident demo <ArrowRight size={14} />
-          </button>
-          <button className="button" disabled={busy} onClick={newChat}>
+          <button
+            className="button"
+            disabled={busy}
+            onClick={async () => {
+              requestVersion.current += 1;
+              setBusy(true);
+              try {
+                await newChat();
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
             <Plus size={16} /> New chat
           </button>
         </div>
@@ -227,7 +309,6 @@ export default function Workspace({
               </span>
               <div>
                 <strong>CounterForge</strong>
-                <small>Evidence analyst</small>
               </div>
             </div>
             <select
@@ -244,7 +325,7 @@ export default function Workspace({
             >
               {overview.sessions.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.title}
+                  {s.id === session?.id && selectedRun ? runLabel(selectedRun) : s.title}
                 </option>
               ))}
             </select>
@@ -255,7 +336,7 @@ export default function Workspace({
                 <span className="cf-welcome-icon">
                   <Sparkles size={28} />
                 </span>
-                <h2>What would you like to test?</h2>
+                <h2>How can I help?</h2>
                 <p>
                   Try “Use the support assistant, defense off, one round.” Then
                   say “Start a new run.”
@@ -269,24 +350,18 @@ export default function Workspace({
             {messages.map((m) => (
               <div key={m.id} className={"cf-message " + m.role}>
                 <span className="cf-message-icon">
-                  {m.role === "assistant" ? <Sparkles size={16} /> : "S"}
+                  {m.role === "assistant" ? (
+                    <Sparkles size={16} />
+                  ) : (
+                    <UserRound size={16} />
+                  )}
                 </span>
                 <div>
                   <div className="cf-message-meta">
                     <strong>
                       {m.role === "assistant" ? "CounterForge" : "You"}
                     </strong>
-                    <small>
-                      {m.role === "assistant"
-                        ? [
-                            "Chat settings",
-                            "Run controller",
-                            "Saved evidence",
-                          ].includes(m.source)
-                          ? m.source
-                          : "Evidence analyst"
-                        : date(m.timestamp)}
-                    </small>
+                    {m.role === "user" && <small>{date(m.timestamp)}</small>}
                   </div>
                   <MessageContent
                     content={readable(m.content)}
@@ -297,30 +372,49 @@ export default function Workspace({
                     <div className="cf-inline-card">
                       <RunList
                         runs={m.card.runs}
-                        selectedId={run?.id}
+                        selectedId={selectedId}
+                        select={selectRun}
+                        disabled={busy}
                         open={open}
                       />
                     </div>
                   )}
                   {m.card?.type === "run" && (
-                    <button
-                      className="cf-run-link"
-                      onClick={() => open(m.card.run_id)}
-                    >
-                      <FlaskConical size={15} />
-                      {m.card.name ||
-                        runLabel(runs.find((r) => r.id === m.card.run_id))}
-                      <ArrowRight size={14} />
-                    </button>
+                    <div className="cf-run-actions">
+                      <button
+                        className="cf-run-link"
+                        onClick={() => open(m.card.run_id)}
+                      >
+                        <FlaskConical size={15} />
+                        {m.card.name ||
+                          runLabel(runs.find((r) => r.id === m.card.run_id))}
+                        <ArrowRight size={14} />
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
             ))}
+            {(session?.console_pending_runs || []).map((id) => {
+              const active = runs.find((r) => r.id === id);
+              return active && (!selectedId || selectedId === id) && ["queued", "running"].includes(active.status) ? (
+                <div key={id} className="cf-run-progress" role="status">
+                  <Loader2 size={15} className="spin" />
+                  <span>
+                    {runLabel(active)}:{" "}
+                    {stageLabels[active.stage] || "In progress"}. Summary will
+                    appear here automatically.
+                  </span>
+                </div>
+              ) : null;
+            })}
             {busy && (
               <>
                 {optimistic && (
                   <div className="cf-message user">
-                    <span className="cf-message-icon">S</span>
+                    <span className="cf-message-icon">
+                      <UserRound size={16} />
+                    </span>
                     <div className="cf-message-content">{optimistic}</div>
                   </div>
                 )}
@@ -344,10 +438,19 @@ export default function Workspace({
             </div>
           )}
           <div className="cf-composer">
-            {run && (
+            {selectedRun ? (
               <div className="cf-analysis-context">
-                Asking about {runLabel(run)}
+                <span>Selected: {runLabel(selectedRun)}</span>
+                <button
+                  aria-label="Clear selected run"
+                  disabled={busy}
+                  onClick={() => selectRun(null)}
+                >
+                  <X size={13} />
+                </button>
               </div>
+            ) : (
+              <div className="cf-analysis-context">No run selected</div>
             )}
             <form
               onSubmit={(e) => {
@@ -357,7 +460,7 @@ export default function Workspace({
             >
               <textarea
                 aria-label="Workspace message"
-                placeholder="Ask about a run, change settings, or say “start a new run”…"
+                placeholder="Ask CounterForge…"
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
                 onKeyDown={(e) => {
@@ -398,11 +501,13 @@ export default function Workspace({
               <Clock3 size={15} /> Run activity
             </h3>
           </div>
-          <p>Open a run for its results in Attack Lab.</p>
+          <p>Select a run to load its conversation. Use the arrow for Attack Lab details.</p>
           {runs.length ? (
             <RunList
               runs={runs.slice(0, 12)}
-              selectedId={run?.id}
+              selectedId={selectedId}
+              select={selectRun}
+              disabled={busy}
               open={open}
             />
           ) : (

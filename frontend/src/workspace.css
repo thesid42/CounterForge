@@ -149,6 +149,8 @@
   font-size: 11px;
 }
 .cf-message.user .cf-message-icon {
+  order: 1;
+  align-self: flex-start;
   background: #32363d;
   color: #c2c8d0;
 }
@@ -185,9 +187,27 @@
 }
 .cf-message.user {
   flex-direction: row;
-  justify-content: flex-start;
-  margin-right: auto;
-  text-align: left;
+  justify-content: flex-end;
+  margin-left: auto;
+  text-align: right;
+}
+.cf-message.user > div {
+  flex: 0 1 auto;
+  max-width: calc(100% - 40px);
+}
+.cf-message.user .cf-message-meta {
+  justify-content: flex-end;
+}
+.cf-run-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  margin: 0 0 18px 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
 }
 .cf-message-content + .cf-text-button {
   margin-top: 8px;
@@ -212,6 +232,16 @@
   margin-top: 12px;
   text-align: left;
 }
+.cf-run-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+.cf-run-actions .cf-run-link {
+  margin-top: 0;
+}
 .cf-thinking {
   display: flex;
   align-items: center;
@@ -226,9 +256,20 @@
   background: #1b1e23;
 }
 .cf-analysis-context {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 10px;
   color: var(--muted);
   margin-bottom: 10px;
+}
+.cf-analysis-context button {
+  display: flex;
+  padding: 3px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
 }
 .cf-composer form {
   display: flex;
@@ -310,27 +351,44 @@
 .cf-recent {
   margin: 12px -8px -6px;
 }
-.cf-recent > button {
+.cf-run-row {
   display: flex;
-  width: 100%;
   align-items: center;
-  gap: 9px;
   background: none;
   border: 1px solid transparent;
   border-radius: 7px;
+}
+.cf-select-run {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: 0;
   padding: 11px 8px;
   text-align: left;
 }
-.cf-recent > button:hover,
-.cf-recent > button.selected {
+.cf-open-run {
+  background: none;
+  border: 0;
+  padding: 8px;
+  color: var(--muted);
+  display: flex;
+}
+.cf-open-run:hover {
+  color: var(--coral);
+}
+.cf-run-row:hover,
+.cf-run-row.selected {
   background: #24282f;
   border-color: #363c46;
 }
-.cf-recent > button > div {
+.cf-select-run > div {
   flex: 1;
   min-width: 0;
 }
-.cf-recent > button > svg {
+.cf-select-run > svg {
   flex-shrink: 0;
   color: var(--muted);
 }

@@ -25,9 +25,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Phone,
-  Plus,
   RefreshCw,
-  Send,
   Settings2,
   Shield,
   ShieldCheck,
@@ -173,12 +171,8 @@ function Button({ children, icon: Icon, className = "", ...props }) {
 
 export default function App() {
   const [page, setPage] = useState("Workspace");
-  const [labConsole, setLabConsole] = useState(true);
   const [overview, setOverview] = useState(null);
   const [session, setSession] = useState(null);
-  const [message, setMessage] = useState("");
-  const [incidentId, setIncidentId] = useState("INC-104");
-  const [poisoned, setPoisoned] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [scenario, setScenario] = useState("all");
@@ -191,7 +185,6 @@ export default function App() {
   const [approval, setApproval] = useState(null);
   const [showRule, setShowRule] = useState(false);
   const [notice, setNotice] = useState("");
-  const bottom = useRef(null);
   const stream = useRef(null);
   const refresh = async () => {
     const data = await api("/overview");
@@ -203,11 +196,13 @@ export default function App() {
     (async () => {
       try {
         const data = await refresh();
-        const current = data.sessions[0]
-          ? await api("/sessions/" + data.sessions[0].id)
+        const rememberedId = localStorage.getItem("counterforge-chat");
+        const saved =
+          data.sessions.find((s) => s.id === rememberedId) || data.sessions[0];
+        const current = saved
+          ? await api("/sessions/" + saved.id)
           : await api("/sessions", {});
         setSession(current);
-        setIncidentId(current.incident_id);
         if (data.runs[0]) setRun(data.runs[0]);
         await refresh();
       } catch (e) {
@@ -217,8 +212,8 @@ export default function App() {
     return () => stream.current?.close();
   }, []);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [session?.messages?.length, busy]);
+    if (session?.id) localStorage.setItem("counterforge-chat", session.id);
+  }, [session?.id]);
   useEffect(() => {
     if (!run || !["queued", "running"].includes(run.status)) return;
     let stopped = false;
@@ -296,27 +291,9 @@ export default function App() {
       setBusy(false);
     }
   }
-  async function send(text = message) {
-    if (!text.trim() || busy || !session) return;
-    const draft = text.trim();
-    setMessage("");
-    const sent = await perform(async () => {
-      const result = await api("/sessions/" + session.id + "/chat", {
-        message: draft,
-        incident_id: incidentId,
-        poisoned,
-      });
-      setSession(result);
-      await refresh();
-      return true;
-    });
-    if (!sent) setMessage((current) => current || draft);
-  }
   async function newChat() {
     await perform(async () => {
       setSession(await api("/sessions", {}));
-      setMessage("");
-      setPoisoned(false);
       await refresh();
     });
   }
@@ -330,6 +307,13 @@ export default function App() {
       });
       setSelectedResult(0);
       setRun(next);
+      if (session)
+        setSession(
+          await api("/sessions/" + session.id + "/context", {
+            run_id: next.id,
+            watch: true,
+          }),
+        );
       await refresh();
     });
   }
@@ -337,7 +321,16 @@ export default function App() {
     return await perform(async () => {
       const value = await api("/agents", payload);
       setTargetId(value.agent.id);
-      if (value.started_run) setRun(value.started_run);
+      if (value.started_run) {
+        setRun(value.started_run);
+        if (session)
+          setSession(
+            await api("/sessions/" + session.id + "/context", {
+              run_id: value.started_run.id,
+              watch: true,
+            }),
+          );
+      }
       await refresh();
       setNotice(
         value.started_run
@@ -352,6 +345,16 @@ export default function App() {
       const next = await api("/lab/runs/" + id);
       setSelectedResult(0);
       setRun(next);
+    });
+  }
+  async function resumeRunChat(id) {
+    await perform(async () => {
+      const saved = await api("/lab/runs/" + id + "/chat", {
+        session_id: session?.id || null,
+      });
+      setSession(saved);
+      setPage("Workspace");
+      await refresh();
     });
   }
   async function approve() {
@@ -379,12 +382,9 @@ export default function App() {
     });
   }
   const actions = overview?.actions || [];
-  const currentAction = (action) =>
-    actions.find((a) => a.id === action?.id) || action;
   const incidents = overview?.incidents || [];
   const selected =
     incidents.find((i) => i.id === selectedIncident) || incidents[0];
-  const fixture = overview?.fixtures?.find((i) => i.id === incidentId);
   const result = run?.results?.[selectedResult];
   const liveRun =
     run?.mode?.includes("dvaa") ||
@@ -392,50 +392,6 @@ export default function App() {
   const legacyLive = liveRun && !run?.adaptive;
   const liveAlerts = overview?.alert_mode === "twilio_voice";
   const adaptive = overview?.role_mode === "adaptive";
-
-  function ApprovalCard({ action }) {
-    const value = currentAction(action);
-    if (!value) return null;
-    return (
-      <div className="approval-card">
-        <div className="section-top">
-          <Phone size={18} />
-          <strong>
-            {value.status === "approved"
-              ? "Responder notified"
-              : "Page the responder?"}
-          </strong>
-        </div>
-        <Badge
-          tone={
-            value.delivery?.status === "Failed"
-              ? "danger"
-              : value.status === "approved"
-                ? "safe"
-                : "warning"
-          }
-        >
-          {value.status === "approved"
-            ? value.delivery?.status || "Approved"
-            : "Approval required"}
-        </Badge>
-        <p>
-          {value.status === "approved"
-            ? value.delivery?.status === "Failed"
-              ? "The provider rejected the alert. The incident remains contained."
-              : value.delivery?.mode === "twilio_voice"
-                ? "The sanitized voice call was submitted to Twilio."
-                : "A simulated notification was recorded. No external call was placed."
-            : `Review the exact message for the allowlisted primary responder${liveAlerts ? " before placing the call" : ""}.`}
-        </p>
-        {value.status === "pending" && (
-          <Button className="primary full" onClick={() => setApproval(value)}>
-            Review action <ArrowRight size={15} />
-          </Button>
-        )}
-      </div>
-    );
-  }
 
   function Transcript({ defended }) {
     const data = defended ? result?.defended : result?.baseline;
@@ -479,7 +435,13 @@ export default function App() {
           </Badge>
           {!defended && run?.page && (
             <Badge
-              tone={run.page.status === "Accepted" ? "danger" : run.page.status === "Failed" ? "warning" : ""}
+              tone={
+                run.page.status === "Accepted"
+                  ? "danger"
+                  : run.page.status === "Failed"
+                    ? "warning"
+                    : ""
+              }
               icon={TriangleAlert}
             >
               {run.page.status === "Accepted"
@@ -649,9 +611,7 @@ export default function App() {
             <ChevronRight size={14} />
             <span>
               {page === "Workspace"
-                ? labConsole
-                  ? "Lab assistant"
-                  : fixture?.service || "Investigation"
+                ? "Ask CounterForge"
                 : page === "Attack lab"
                   ? run
                     ? runLabel(run)
@@ -698,7 +658,7 @@ export default function App() {
           <main
             className={"page " + (page === "Workspace" ? "workspace-page" : "")}
           >
-            {page === "Workspace" && labConsole && (
+            {page === "Workspace" && (
               <Workspace
                 overview={overview}
                 session={session}
@@ -707,6 +667,7 @@ export default function App() {
                 setRun={setRun}
                 refresh={refresh}
                 newChat={newChat}
+                resumeRunChat={resumeRunChat}
                 openLab={(selected) => {
                   if (selected?.target?.id) setTargetId(selected.target.id);
                   if (selected?.scenario) setScenario(selected.scenario);
@@ -715,262 +676,7 @@ export default function App() {
                     setRounds(selected.attack_rounds);
                   setPage("Attack lab");
                 }}
-                openIncidentDemo={() => setLabConsole(false)}
               />
-            )}
-            {page === "Workspace" && !labConsole && (
-              <>
-                <div className="page-heading">
-                  <div>
-                    <div className="eyebrow">
-                      <ShieldCheck size={14} /> DEFENDED ASSISTANT
-                    </div>
-                    <h1>
-                      Investigate with confidence
-                      <span className="title-dot">.</span>
-                    </h1>
-                    <p>Useful incident response. Visible security decisions.</p>
-                  </div>
-                  <Button icon={ArrowLeft} onClick={() => setLabConsole(true)}>
-                    Lab workspace
-                  </Button>
-                  <Button icon={Plus} onClick={newChat} disabled={busy}>
-                    New investigation
-                  </Button>
-                </div>
-                <div className="workspace-grid">
-                  <section className="chat-panel panel">
-                    <div className="chat-top">
-                      <div className="incident-picker">
-                        <FileText size={17} />
-                        <select
-                          aria-label="Incident"
-                          value={incidentId}
-                          onChange={(e) => setIncidentId(e.target.value)}
-                        >
-                          {overview.fixtures.map((i) => (
-                            <option key={i.id} value={i.id}>
-                              {i.id} · {i.service}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <select
-                        className="session-picker"
-                        aria-label="Conversation history"
-                        value={session?.id || ""}
-                        onChange={(e) =>
-                          perform(async () => {
-                            const s = await api("/sessions/" + e.target.value);
-                            setSession(s);
-                            setIncidentId(s.incident_id);
-                          })
-                        }
-                      >
-                        {overview.sessions.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.title}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="chat-history">
-                      {!session?.messages.length ? (
-                        <div className="welcome">
-                          <span className="welcome-mark">
-                            <Mark />
-                          </span>
-                          <h2>Start with an incident.</h2>
-                          <p>
-                            Inspect the evidence, understand the response,
-                            <br />
-                            and keep every action within policy.
-                          </p>
-                          <div className="suggestion-grid">
-                            <button
-                              onClick={() =>
-                                send(
-                                  "Investigate the payment outage and summarize the runbook.",
-                                )
-                              }
-                            >
-                              <Activity size={18} />
-                              <strong>Investigate the outage</strong>
-                              <span>Read the incident and response steps</span>
-                              <ArrowRight size={15} />
-                            </button>
-                            <button
-                              onClick={() => send("Draft an incident update.")}
-                            >
-                              <FileText size={18} />
-                              <strong>Draft an update</strong>
-                              <span>Prepare a response for review</span>
-                              <ArrowRight size={15} />
-                            </button>
-                          </div>
-                          <div className="welcome-note">
-                            <LockKeyhole size={13} /> Synthetic incidents · No
-                            model API required
-                          </div>
-                        </div>
-                      ) : (
-                        session.messages.map((m) => (
-                          <div className={"message " + m.role} key={m.id}>
-                            <div className="message-avatar">
-                              {m.role === "assistant" ? <Mark small /> : "S"}
-                            </div>
-                            <div className="message-body">
-                              <div className="message-label">
-                                <strong>
-                                  {m.role === "assistant"
-                                    ? "CounterForge"
-                                    : "You"}
-                                </strong>
-                                <small>{timeLabel(m.timestamp)}</small>
-                                {m.role === "assistant" && (
-                                  <span className="demo-label">
-                                    Fixture response
-                                  </span>
-                                )}
-                              </div>
-                              <div className="message-text">{m.content}</div>
-                              {m.sources?.length > 0 && (
-                                <div className="source-list">
-                                  {m.sources.map((s) => (
-                                    <span key={s}>
-                                      <FileText size={12} />
-                                      {s}
-                                    </span>
-                                  ))}
-                                </div>
-                              )}
-                              {m.blocked && (
-                                <div className="blocked-banner">
-                                  <TriangleAlert size={17} />
-                                  <div>
-                                    <strong>
-                                      Suspicious instruction blocked
-                                    </strong>
-                                    <p>
-                                      The retrieved content attempted to export
-                                      protected incident data.
-                                    </p>
-                                  </div>
-                                </div>
-                              )}
-                              {m.action && <ApprovalCard action={m.action} />}
-                            </div>
-                          </div>
-                        ))
-                      )}
-                      {busy && (
-                        <div className="thinking">
-                          <Loader2 className="spin" size={15} />
-                          Inspecting local evidence…
-                        </div>
-                      )}
-                      <div ref={bottom} />
-                    </div>
-                    <div className="chat-compose">
-                      <label className="fixture-toggle">
-                        <input
-                          type="checkbox"
-                          checked={poisoned}
-                          onChange={(e) => setPoisoned(e.target.checked)}
-                        />
-                        <span className={"toggle " + (poisoned ? "on" : "")} />
-                        <span>Use injected runbook</span>
-                        <Badge tone={poisoned ? "warning" : ""}>
-                          {poisoned ? "Injected runbook" : "Clean runbook"}
-                        </Badge>
-                      </label>
-                      <form
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          send();
-                        }}
-                      >
-                        <textarea
-                          aria-label="Message"
-                          placeholder="Ask about an incident or response step…"
-                          value={message}
-                          onChange={(e) => setMessage(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
-                              e.preventDefault();
-                              send();
-                            }
-                          }}
-                        />
-                        <button
-                          className="send-button"
-                          aria-label="Send message"
-                          disabled={busy || !message.trim()}
-                        >
-                          <Send size={18} />
-                        </button>
-                      </form>
-                      <div className="compose-foot">
-                        Local deterministic assistant{" "}
-                        <span>
-                          Enter to send · Shift + Enter for a new line
-                        </span>
-                      </div>
-                    </div>
-                  </section>
-                  <aside className="timeline-column">
-                    <div className="panel security-panel">
-                      <div className="panel-header">
-                        <h3>Security timeline</h3>
-                        <Badge>{session?.events.length || 0} events</Badge>
-                      </div>
-                      {!session?.events.length ? (
-                        <Empty
-                          icon={ShieldCheck}
-                          title="Every decision, visible"
-                        >
-                          Sources, tool checks, and blocked actions will appear
-                          here as you investigate.
-                        </Empty>
-                      ) : (
-                        <div className="timeline">
-                          {session.events.map((e) => (
-                            <div
-                              className={"timeline-item " + e.status}
-                              key={e.id}
-                            >
-                              <span className="timeline-dot" />
-                              <small>{timeLabel(e.timestamp)}</small>
-                              <strong>{e.title}</strong>
-                              <p>{e.detail}</p>
-                              {e.rule && (
-                                <div className="evidence">
-                                  <span>Policy</span>
-                                  <strong>{e.rule}</strong>
-                                  <span>Protected data</span>
-                                  <strong>Redacted</strong>
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <div className="policy-note">
-                      <ShieldCheck size={20} />
-                      <div>
-                        <strong>
-                          Policy v{overview.policy.version} active
-                        </strong>
-                        <p>Permissions are enforced before tools execute.</p>
-                        <button onClick={() => setPage("Defenses")}>
-                          Inspect defenses <ArrowRight size={12} />
-                        </button>
-                      </div>
-                    </div>
-                  </aside>
-                </div>
-              </>
             )}
             {page === "Attack lab" && (
               <AttackLab
@@ -992,6 +698,7 @@ export default function App() {
                 busy={busy}
                 startRun={startRun}
                 openRun={openRun}
+                resumeRunChat={resumeRunChat}
                 activate={activate}
                 viewRule={() => setShowRule(true)}
                 clearDefense={() =>
@@ -1128,23 +835,24 @@ export default function App() {
                     </h1>
                     <p>Track containment, escalation, and acknowledgment.</p>
                   </div>
-                  <Badge icon={Phone}>Simulated provider</Badge>
+                  <Badge icon={Phone}>
+                    {liveAlerts ? "Twilio voice" : "Simulated provider"}
+                  </Badge>
                 </div>
                 {!incidents.length ? (
                   <div className="panel">
                     <Empty icon={Bell} title="No security incidents yet">
-                      Enable the injected runbook in Workspace and investigate
-                      an incident to trigger detection.
+                      Run a security test in Attack Lab. A confirmed breach
+                      creates an incident for review.
                     </Empty>
                     <div className="empty-action">
                       <Button
                         className="primary"
                         onClick={() => {
-                          setPoisoned(true);
-                          setPage("Workspace");
+                          setPage("Attack lab");
                         }}
                       >
-                        Try the injection demo <ArrowRight size={15} />
+                        Open Attack Lab <ArrowRight size={15} />
                       </Button>
                     </div>
                   </div>
