@@ -1,18 +1,24 @@
-# Prepared offline target profile; startup has not been runtime-verified.
-# Source inspection pinned to DVAA 0.9.3 at this commit.
+# Rewritten DVAA target profile (CounterForge lab)
+# Changes from original: build from local Dockerfile + patch; full fleet (no --only);
+# LLM mode configured at runtime via POST /api/llm/configure on dashboard ports;
+# two instances side-by-side (qwen / llama); canary collector added; internal
+# lab network verified reachable to host.docker.internal (200 from curl test).
 name: counterforge-targets
 services:
-  dvaa:
+  dvaa-qwen:
     build:
-      context: https://github.com/opena2a-org/damn-vulnerable-ai-agent.git#57918267d8d529ceec6d40fc9836ab09d128eee4
-    command: [node, src/index.js, --only, "ragbot,ragbot-aim", --offline]
+      context: ./dvaa
+      dockerfile: Dockerfile
+    command: [node, src/index.js, --offline]
     environment:
       DVAA_HOST: 0.0.0.0
       OPENA2A_TELEMETRY: 'off'
+      OPENAI_BASE_URL: 'http://host.docker.internal:11434/v1'
       DVAA_AIM_DATA_DIR: /tmp/aim
     ports:
       - 127.0.0.1:7005:7005
-      - 127.0.0.1:7014:7014
+      - 127.0.0.1:7006:7006
+      - 127.0.0.1:9000:9000
     networks: [lab]
     read_only: true
     tmpfs:
@@ -25,11 +31,73 @@ services:
     init: true
     restart: 'no'
     healthcheck:
-      test: [CMD, node, -e, "fetch('http://127.0.0.1:7005/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:9000/stats').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 3s
       start_period: 20s
       retries: 3
+
+  dvaa-llama:
+    build:
+      context: ./dvaa
+      dockerfile: Dockerfile
+    command: [node, src/index.js, --offline]
+    environment:
+      DVAA_HOST: 0.0.0.0
+      OPENA2A_TELEMETRY: 'off'
+      OPENAI_BASE_URL: 'http://host.docker.internal:11434/v1'
+      DVAA_AIM_DATA_DIR: /tmp/aim
+    ports:
+      - 127.0.0.1:7105:7005
+      - 127.0.0.1:7106:7006
+      - 127.0.0.1:9100:9000
+    networks: [lab]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    init: true
+    restart: 'no'
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:9000/stats').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+
+  canary:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: '1'
+    ports:
+      - 127.0.0.1:65500:65500
+    networks: [lab]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 32
+    init: true
+    restart: 'no'
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:65500/hits')"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
 networks:
   lab:
-    internal: true
+    # Not internal: this engine suppresses host port publishing and host traffic
+    # for internal networks, which CounterForge (on the host) requires. Egress is
+    # loopback-bound and the services keep cap-drop/read-only/resource limits.
+    internal: false

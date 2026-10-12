@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .fixtures import INCIDENTS
+from .config import settings
 from .models import ApprovalRequest, ChatRequest, LabRequest
 from .service import LabService
 from .workflow import make_graph, new_campaign, run_campaign
@@ -52,11 +53,12 @@ def create_app(service=None):
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "name": "CounterForge", "model_mode": "demo", "target_mode": "local-simulation", "alert_mode": "simulated", "policy_version": service.policy.version}
+        live = settings.MODEL_MODE != "demo" and bool(settings.TARGET_BASE_URL)
+        return {"status": "ok", "name": "CounterForge", "model_mode": settings.MODEL_MODE, "target_mode": "dvaa" if live else "local-simulation", "alert_mode": settings.ALERT_MODE, "policy_version": service.policy.version}
 
     @app.get("/api/overview")
     def overview():
-        return {"sessions": [{"id": s["id"], "title": s["title"]} for s in service.store.list("session")], "incidents": service.store.list("incident"), "actions": service.store.list("action"), "runs": service.store.list("run"), "policy": service.policy.to_dict(), "can_rollback": bool(service.store.list("policy_history")), "fixtures": list(INCIDENTS.values()), "mode": "demo"}
+        return {"sessions": [{"id": s["id"], "title": s["title"]} for s in service.store.list("session")], "incidents": service.store.list("incident"), "actions": service.store.list("action"), "runs": service.store.list("run"), "policy": service.policy.to_dict(), "can_rollback": bool(service.store.list("policy_history")), "fixtures": list(INCIDENTS.values()), "mode": "live" if settings.MODEL_MODE != "demo" else "demo"}
 
     @app.post("/api/sessions")
     def new_session():

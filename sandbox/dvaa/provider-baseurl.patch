@@ -1,0 +1,44 @@
+diff --git a/src/index.js b/src/index.js
+index 56cb8af..ad57979 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -538,8 +538,11 @@ async function generateResponseImpl(agent, userMessage, attacks) {
+   // The request and its detected categories were counted by generateResponse
+   // (openAccounting). Paths below credit success through trackCategorySuccessful.
+ 
+-  // LLM Mode: Use real LLM with vulnerable system prompt
+-  if (isLLMEnabled()) {
++  // LLM Mode: Use real LLM with vulnerable system prompt.
++  // URL-exfil injection messages must fall through to the deterministic tool
++  // path below: the LLM narrates, but the outbound tool decision stays local
++  // so the canary collector proves (or disproves) actual data egress.
++  if (isLLMEnabled() && !detectUrlExfiltrationInjection(userMessage)) {
+     const { AGENT_PROMPTS, revealsPlantedData } = await import('./llm/prompts.js');
+     const prompt = AGENT_PROMPTS[agent.id];
+     if (prompt) {
+diff --git a/src/llm/provider.js b/src/llm/provider.js
+index 67ca729..7cf987b 100644
+--- a/src/llm/provider.js
++++ b/src/llm/provider.js
+@@ -83,7 +83,10 @@ async function callOpenAI(systemPrompt, messages, maxTokens) {
+     ...messages.map(m => ({ role: m.role, content: m.content })),
+   ];
+ 
+-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
++  // Honors OPENAI_BASE_URL (a /v1 root, OpenAI SDK convention) for local
++  // inference servers such as Ollama; falls back to the upstream default.
++  const openaiBaseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '');
++  const resp = await fetch(`${openaiBaseUrl}/chat/completions`, {
+     method: 'POST',
+     headers: {
+       'Authorization': `Bearer ${llmConfig.apiKey}`,
+@@ -100,7 +103,8 @@ async function callOpenAI(systemPrompt, messages, maxTokens) {
+       // older models accept the default too, so omitting it works on every
+       // OpenAI model without maintaining a model-family allowlist.
+     }),
+-    signal: AbortSignal.timeout(30000),
++    // Local model servers may need a cold model load; allow two minutes.
++    signal: AbortSignal.timeout(120000),
+   });
+ 
+   if (!resp.ok) {

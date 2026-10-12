@@ -334,15 +334,29 @@ export default function App() {
               : "Baseline"}
           </h3>
           <Badge
-            tone={data ? (defended ? "safe" : "danger") : ""}
-            icon={data ? (defended ? ShieldCheck : TriangleAlert) : Clock3}
+            tone={
+              !data
+                ? ""
+                : data.verdict === "succeeded"
+                  ? "danger"
+                  : data.verdict === "error"
+                    ? "warning"
+                    : "safe"
+            }
+            icon={!data ? Clock3 : data.verdict === "succeeded" ? TriangleAlert : ShieldCheck}
           >
-            {data ? (defended ? "Blocked" : "Breach observed") : "Waiting"}
+            {!data
+              ? "Waiting"
+              : data.verdict === "succeeded"
+                ? "Breach observed"
+                : data.verdict === "error"
+                  ? "Target error"
+                  : "Blocked"}
           </Badge>
         </div>
         {!data ? (
           <Empty icon={FlaskConical} title="Ready for a comparison">
-            Run a scenario to inspect real fixture execution.
+            Run a scenario to inspect live target execution.
           </Empty>
         ) : (
           <div className="trace-content">
@@ -359,7 +373,7 @@ export default function App() {
               <BookOpen />
               <div>
                 <small>{result.surface.replace("_", " ")} attack surface</small>
-                <pre>{result.payload}</pre>
+                <pre>{data.request_content || result.payload}</pre>
               </div>
             </div>
             <div className="trace-row">
@@ -373,7 +387,12 @@ export default function App() {
                 </pre>
               </div>
             </div>
-            <div className={"trace-outcome " + (defended ? "safe" : "danger")}>
+            <div
+              className={
+                "trace-outcome " +
+                (data.verdict === "succeeded" ? "danger" : "safe")
+              }
+            >
               <CheckCircle2 size={16} />
               <span>
                 {data.canary_leaked
@@ -463,10 +482,14 @@ export default function App() {
             </span>
           </div>
           <div className="topbar-right">
-            <Badge icon={FlaskConical}>Demo mode</Badge>
+            <Badge icon={FlaskConical}>
+              {overview?.mode === "live" ? "Live target" : "Demo mode"}
+            </Badge>
             <Badge tone="safe">
               <span className="status-dot" />
-              Local fixture target
+              {overview?.mode === "live"
+                ? "DVAA · Ollama (live)"
+                : "Local fixture target"}
             </Badge>
             <span className="operator-circle">S</span>
           </div>
@@ -767,7 +790,11 @@ export default function App() {
                   <div>
                     <label>Target</label>
                     <select aria-label="Lab target">
-                      <option>Local fixture target</option>
+                      <option>
+                        {overview?.mode === "live"
+                          ? "DVAA RAGBot · local Ollama (live)"
+                          : "Local fixture target"}
+                      </option>
                     </select>
                   </div>
                   <div>

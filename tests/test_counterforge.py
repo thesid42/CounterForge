@@ -19,6 +19,17 @@ def service():
     return LabService(Store(":memory:"))
 
 
+@pytest.fixture(autouse=True)
+def force_demo_mode():
+    """Tests exercise the fixture path unless they explicitly opt into live mode."""
+    from backend.config import settings
+    saved = (settings.MODEL_MODE, settings.TARGET_BASE_URL)
+    settings.MODEL_MODE = "demo"
+    settings.TARGET_BASE_URL = ""
+    yield
+    settings.MODEL_MODE, settings.TARGET_BASE_URL = saved
+
+
 @pytest.fixture
 def client(service):
     with TestClient(create_app(service)) as client:
@@ -202,3 +213,93 @@ def test_adapter_with_no_text_or_tools_has_safe_fallback(service):
     service.adapter = EmptyAdapter()
     data = asyncio.run(service.chat(service.new_session()["id"], ChatRequest(message="hello")))
     assert data["messages"][-1]["content"].startswith("No action was proposed.")
+
+
+def test_dvaa_succeeded_when_collector_canary_hit():
+    from backend.config import settings
+    from backend.targets import DVAATarget, TargetResult
+    from backend.fixtures import CANARY, ATTACKS
+    from backend.service import execute_lab_attack
+    from backend.policy import Policy
+    original_mode = settings.MODEL_MODE
+    original_target = settings.TARGET_BASE_URL
+    original_run = DVAATarget.run
+    original_hits = DVAATarget.collector_hits
+    try:
+        settings.MODEL_MODE = "live"
+        settings.TARGET_BASE_URL = "http://test"
+        async def mock_run(self, messages):
+            return TargetResult(text="Response with secret")
+        async def mock_hits(self):
+            return [{"path": "/api/canary/exfil-test", "query": "data=" + CANARY, "body": ""}]
+        DVAATarget.run = mock_run
+        DVAATarget.collector_hits = mock_hits
+        DVAATarget.collector_reset = lambda self: asyncio.sleep(0)
+        result = execute_lab_attack(ATTACKS[0], Policy())
+        assert result["verdict"] == "succeeded"
+        assert result["mode"] == "dvaa"
+        assert result["target"] == "http://test"
+        assert result["canary_leaked"] is True
+        assert result["unauthorized_actions"] > 0
+    finally:
+        settings.MODEL_MODE = original_mode
+        settings.TARGET_BASE_URL = original_target
+        DVAATarget.run = original_run
+        DVAATarget.collector_hits = original_hits
+
+
+def test_dvaa_blocked_when_clean_and_no_hits():
+    from backend.config import settings
+    from backend.targets import DVAATarget, TargetResult
+    from backend.fixtures import ATTACKS
+    from backend.service import execute_lab_attack
+    from backend.policy import Policy
+    original_mode = settings.MODEL_MODE
+    original_target = settings.TARGET_BASE_URL
+    original_run = DVAATarget.run
+    original_hits = DVAATarget.collector_hits
+    try:
+        settings.MODEL_MODE = "live"
+        settings.TARGET_BASE_URL = "http://test"
+        async def mock_run(self, messages):
+            return TargetResult(text="All clear")
+        async def mock_hits(self):
+            return []
+        DVAATarget.run = mock_run
+        DVAATarget.collector_hits = mock_hits
+        DVAATarget.collector_reset = lambda self: asyncio.sleep(0)
+        result = execute_lab_attack(ATTACKS[2], Policy())
+        assert result["verdict"] == "blocked"
+        assert result["mode"] == "dvaa"
+        assert result["canary_leaked"] is False
+        assert result["unauthorized_actions"] == 0
+    finally:
+        settings.MODEL_MODE = original_mode
+        settings.TARGET_BASE_URL = original_target
+        DVAATarget.run = original_run
+        DVAATarget.collector_hits = original_hits
+
+
+def test_dvaa_error_when_target_unreachable():
+    from backend.config import settings
+    from backend.targets import DVAATarget
+    from backend.fixtures import ATTACKS
+    from backend.service import execute_lab_attack
+    from backend.policy import Policy
+    original_mode = settings.MODEL_MODE
+    original_target = settings.TARGET_BASE_URL
+    original_run = DVAATarget.run
+    try:
+        settings.MODEL_MODE = "live"
+        settings.TARGET_BASE_URL = "http://unreachable"
+        async def mock_run(self, messages):
+            raise ConnectionError("No route to host")
+        DVAATarget.run = mock_run
+        result = execute_lab_attack(ATTACKS[0], Policy())
+        assert result["verdict"] == "error"
+        assert result["mode"] == "dvaa"
+        assert "unreachable" in result["reason"].lower() or "No route" in result["reason"]
+    finally:
+        settings.MODEL_MODE = original_mode
+        settings.TARGET_BASE_URL = original_target
+        DVAATarget.run = original_run
