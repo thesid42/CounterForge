@@ -48,6 +48,7 @@ class LabRequest(BaseModel):
     target_id: str | None = Field(default=None, max_length=64)
     autonomous: bool = True
     rounds: int = Field(default=2, ge=1, le=3)
+    workspace_session_id: str | None = Field(default=None, max_length=64)
 
 
 class ApprovalRequest(BaseModel):
@@ -63,3 +64,12 @@ class PageArgs(BaseModel):
 class ExportArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     destination: str = Field(min_length=1, max_length=60)
+
+
+class LabBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_ids: list[str] = Field(min_length=1, max_length=16)
+    scenario: Literal["all", "runbook-injection", "tool-result-injection", "role-escalation", "data-extraction"] = "all"
+    apply_defense: bool = True
+    rounds: int | None = Field(default=None, ge=1, le=3)
+    workspace_session_id: str | None = Field(default=None, max_length=64)

@@ -67,13 +67,41 @@ def register_agent(service, payload):
     return agent, True
 
 
+# DVAA fleet personas (OpenAI-compatible API agents) served by the dvaa-qwen container.
+DVAA_AGENTS = [
+    ("securebot", "SecureBot", 7001, "hardened", "Reference implementation with proper security controls", "support"),
+    ("helperbot", "HelperBot", 7002, "weak", "Typical chatbot with common security gaps", "support"),
+    ("legacybot", "LegacyBot", 7003, "critical", "Older agent with minimal security, maximum vulnerabilities", "incident"),
+    ("codebot", "CodeBot", 7004, "vulnerable", "Coding assistant with dangerous tool access", "incident"),
+    ("ragbot", "RAGBot", 7005, "weak", "RAG agent with poisonable knowledge base", "research"),
+    ("visionbot", "VisionBot", 7006, "weak", "Follows instructions hidden in image captions and OCR text", "research"),
+    ("memorybot", "MemoryBot", 7007, "vulnerable", "Persistent memory agent with no input sanitization", "support"),
+    ("longwindbot", "LongwindBot", 7008, "weak", "Small context window, safety instructions at the end", "support"),
+    ("ragbot-aim", "RAGBot-AIM", 7014, "weak", "RAGBot under AIM capability enforcement", "research"),
+    ("researchbot", "ResearchBot", 7015, "weak", "Research agent that follows indirect injections from fetched pages", "research"),
+    ("researchbot-aim", "ResearchBot-AIM", 7016, "weak", "ResearchBot under AIM capability enforcement", "research"),
+    ("flightbot", "FlightBot", 7017, "weak", "Flight-booking agent that follows indirect injections", "support"),
+    ("flightbot-aim", "FlightBot-AIM", 7018, "weak", "FlightBot under AIM capability enforcement", "support"),
+    ("repobot", "RepoBot", 7022, "weak", "Code-review agent that follows a repo's agent-config file", "research"),
+    ("repobot-aim", "RepoBot-AIM", 7023, "weak", "RepoBot under AIM capability enforcement", "research"),
+]
+
+
+def dvaa_targets():
+    return [{"id": f"dvaa-{slug}", "name": f"DVAA {name}", "persona": persona, "description": desc,
+             "security_level": level, "port": port, "model": settings.TARGET_MODEL or "qwen2.5:3b",
+             "base_url": f"http://127.0.0.1:{port}/v1", "adapter": "dvaa",
+             "tools": PERSONAS[persona]["tools"], "template": True}
+            for slug, name, port, level, desc, persona in DVAA_AGENTS]
+
+
 def target_catalog(service):
     # Templates do not auto-run until the operator registers one.
     defaults = [{"id": f"local-{persona}", "name": value["name"], "persona": persona,
                  "model": settings.TARGET_MODEL or "qwen2.5:3b", "base_url": "http://127.0.0.1:11434/v1",
                  "adapter": "managed", "tools": value["tools"], "template": True}
                 for persona, value in PERSONAS.items()]
-    return service.store.list("agent") + defaults
+    return service.store.list("agent") + dvaa_targets() + defaults
 
 
 def resolve_target(service, target_id):

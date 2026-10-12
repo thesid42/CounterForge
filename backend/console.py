@@ -225,6 +225,76 @@ class WorkspaceConsole:
             if run_id in self.pending_runs(session):
                 await self.sync_run_updates(session["id"])
 
+    async def record_lab_launch(self, sid, runs, batch=False):
+        """Attach Attack Lab runs to a Workspace conversation."""
+        async with self.locks.setdefault(sid, asyncio.Lock()):
+            session = self.service.session(sid)
+            runs = [run for run in runs if run]
+            if not runs:
+                return session
+            run_ids = [run["id"] for run in runs]
+            history = session.setdefault("console_messages", [])
+            announced = {
+                run_id
+                for message in history
+                if message.get("source") == "Attack Lab"
+                for run_id in message.get("launch_run_ids", [])
+            }
+            new_runs = [run for run in runs if run["id"] not in announced]
+            session["console_pending_runs"] = list(
+                dict.fromkeys([*self.pending_runs(session), *run_ids])
+            )
+            if batch:
+                session["console_run_id"] = None
+            else:
+                session["console_run_id"] = runs[0]["id"]
+            if new_runs:
+                defense = "on" if new_runs[0].get("apply_defense", True) else "off"
+                if batch:
+                    content = (
+                        f"Started a batch from Attack Lab against {len(new_runs)} bots. "
+                        f"Defense {defense}. I will post each result here when it finishes."
+                    )
+                    card = {
+                        "type": "history",
+                        "runs": [run_summary(run) for run in new_runs],
+                    }
+                    if session.get("title") == "New chat":
+                        session["title"] = f"Attack Lab batch, {len(new_runs)} bots"
+                else:
+                    run = new_runs[0]
+                    rounds = run.get("attack_rounds", 2)
+                    content = (
+                        f"Started {run_name(run)} from Attack Lab. Defense {defense}, "
+                        f"{rounds} round{'s' if rounds != 1 else ''}. "
+                        "I will post the result here when it finishes."
+                    )
+                    card = {
+                        "type": "run",
+                        "run_id": run["id"],
+                        "name": run_name(run),
+                    }
+                    if session.get("title") == "New chat":
+                        session["title"] = run_name(run)
+                history.append(
+                    {
+                        "id": "lab-launch-" + (runs[0].get("batch_id") or runs[0]["id"]),
+                        "role": "assistant",
+                        "run_id": None if batch else runs[0]["id"],
+                        "launch_run_ids": [run["id"] for run in new_runs],
+                        "content": content,
+                        "source": "Attack Lab",
+                        "card": card,
+                        "detailed": False,
+                        "timestamp": now(),
+                    }
+                )
+            self.service.store.put("session", sid, session)
+        await self.service.broker.publish(
+            sid, {"type": "lab_run_started", "run_ids": run_ids}
+        )
+        return session
+
     async def resume_run_chat(self, run_id, fallback_sid=None):
         if not self.service.store.get("run", run_id):
             raise KeyError("Run not found")

@@ -1,4 +1,6 @@
 import asyncio
+import os
+from uuid import uuid4
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,10 +11,17 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .fixtures import INCIDENTS
 from .config import settings
-from .console import ConsoleRequest, RunContextRequest, ResumeRunRequest, WorkspaceConsole, assistant_config, run_summary
-from .models import ApprovalRequest, ChatRequest, LabRequest
+from .console import (
+    ConsoleRequest,
+    ResumeRunRequest,
+    RunContextRequest,
+    WorkspaceConsole,
+    assistant_config,
+    run_summary,
+)
+from .models import ApprovalRequest, ChatRequest, LabBatchRequest, LabRequest
 from .roles import live_lab_ready, role_models_configured
-from .service import LabService
+from .service import LabService, now
 from .workflow import make_graph, new_campaign, run_campaign
 from .agents import AgentRegistration, PERSONAS, register_agent, resolve_target, target_catalog
 from .policy import redact
@@ -46,7 +55,7 @@ def create_app(service=None):
     @asynccontextmanager
     async def lifespan(app):
         for run in service.store.list("run"):
-            if run["status"] == "running":
+            if run["status"] in {"running", "batched"}:
                 service.store.put("run", run["id"], {**run, "status": "failed", "stage": "error", "error": "Backend restarted during evaluation"})
         for session in service.store.list("session"):
             await console.sync_run_updates(session["id"])
@@ -79,6 +88,79 @@ def create_app(service=None):
         service.store.put("run", state["id"], queued)
         schedule()
         return queued if enqueue else state
+
+    async def run_batch(batch_id, states):
+        limit = asyncio.Semaphore(max(1, int(os.getenv("LAB_PARALLEL", "4"))))
+
+        async def one(state):
+            async with limit:
+                running = {**state, "status": "running"}
+                service.store.put("run", state["id"], running)
+                await run_campaign(service, graph, running)
+                await console.publish_run_completion(state["id"])
+
+        await asyncio.gather(*(one(s) for s in states), return_exceptions=True)
+        batch = service.store.get("batch", batch_id)
+        service.store.put("batch", batch_id, {**batch, "status": "completed", "completed_at": now()})
+        schedule()
+
+    def batch_view(batch):
+        runs = [service.store.get("run", rid) or {} for rid in batch["run_ids"]]
+        rows = []
+        for r in runs:
+            results = r.get("results") or []
+            rows.append({"run_id": r.get("id"), "target": (r.get("target") or {}).get("name"),
+                         "port": (r.get("target") or {}).get("port"), "status": r.get("status"), "stage": r.get("stage"),
+                         "attacks": len(results),
+                         "breaches": sum((x.get("baseline") or {}).get("verdict") == "succeeded" for x in results),
+                         "blocked_after": sum((x.get("defended") or {}).get("verdict") == "blocked" for x in results),
+                         "page": (r.get("page") or {}).get("status"), "error": r.get("error")})
+        return {**batch, "runs": rows}
+
+    @app.post("/api/lab/batches")
+    async def start_batch(payload: LabBatchRequest):
+        if any(not t.done() for t in tasks):
+            raise HTTPException(409, "A comparison is already running")
+        if not live_lab_ready() and not role_models_configured() and not settings.ALLOW_SIMULATION:
+            raise HTTPException(409, "Live lab is not configured.")
+        if payload.workspace_session_id:
+            try:
+                service.session(payload.workspace_session_id)
+            except KeyError as exc:
+                raise HTTPException(404, "Workspace conversation not found") from exc
+        batch_id = uuid4().hex
+        states = []
+        try:
+            for tid in dict.fromkeys(payload.target_ids):
+                state = new_campaign(service, payload.scenario, apply_defense=payload.apply_defense,
+                                     target=resolve_target(service, tid), autonomous=False, rounds=payload.rounds)
+                state = {**state, "batch_id": batch_id, "status": "batched"}
+                service.store.put("run", state["id"], state)
+                states.append(state)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        batch = {"id": batch_id, "status": "running", "created_at": now(), "scenario": payload.scenario,
+                 "apply_defense": payload.apply_defense, "run_ids": [s["id"] for s in states]}
+        service.store.put("batch", batch_id, batch)
+        if payload.workspace_session_id:
+            await console.record_lab_launch(
+                payload.workspace_session_id, states, batch=True
+            )
+        task = asyncio.create_task(run_batch(batch_id, states))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return batch_view(batch)
+
+    @app.get("/api/lab/batches")
+    def list_batches():
+        return sorted((batch_view(b) for b in service.store.list("batch")), key=lambda b: b["created_at"], reverse=True)[:10]
+
+    @app.get("/api/lab/batches/{bid}")
+    def get_batch(bid: str):
+        batch = service.store.get("batch", bid)
+        if not batch:
+            raise HTTPException(404, "Batch not found")
+        return batch_view(batch)
 
     console = WorkspaceConsole(service, launch)
 
@@ -209,7 +291,17 @@ def create_app(service=None):
 
     @app.post("/api/lab/runs")
     async def start_run(payload: LabRequest):
-        return await launch(payload)
+        if payload.workspace_session_id:
+            try:
+                service.session(payload.workspace_session_id)
+            except KeyError as exc:
+                raise HTTPException(404, "Workspace conversation not found") from exc
+        started = await launch(payload)
+        if payload.workspace_session_id:
+            await console.record_lab_launch(
+                payload.workspace_session_id, [started]
+            )
+        return started
 
     @app.get("/api/lab/runs/{rid}")
     def run(rid: str):

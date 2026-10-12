@@ -379,6 +379,79 @@ def test_lab_started_run_can_be_watched_even_if_it_finished_before_chat_attached
     assert session["console_messages"][0]["completion_run_id"] == "fast"
 
 
+def test_attack_lab_launch_is_immediately_visible_in_workspace_chat(lab, monkeypatch):
+    service, client, sid = lab
+    release = Event()
+
+    async def campaign(service, graph, state):
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        service.store.put(
+            "run", state["id"], {**state, "status": "completed", "results": []}
+        )
+
+    monkeypatch.setattr("backend.main.run_campaign", campaign)
+    response = client.post(
+        "/api/lab/runs",
+        json={
+            "scenario": "runbook-injection",
+            "workspace_session_id": sid,
+        },
+    )
+    assert response.status_code == 200
+    run_id = response.json()["id"]
+    session = service.session(sid)
+    launch = session["console_messages"][-1]
+    assert launch["source"] == "Attack Lab"
+    assert launch["card"]["run_id"] == run_id
+    assert "Started" in launch["content"] and "from Attack Lab" in launch["content"]
+    assert session["console_run_id"] == run_id
+    assert session["console_pending_runs"] == [run_id]
+    release.set()
+
+
+def test_attack_lab_batch_is_visible_and_posts_each_completion(lab, monkeypatch):
+    service, client, sid = lab
+    release = Event()
+
+    async def campaign(service, graph, state):
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        service.store.put(
+            "run", state["id"], {**state, "status": "completed", "results": []}
+        )
+
+    monkeypatch.setattr("backend.main.run_campaign", campaign)
+    response = client.post(
+        "/api/lab/batches",
+        json={
+            "target_ids": ["dvaa-securebot", "dvaa-helperbot"],
+            "scenario": "data-extraction",
+            "workspace_session_id": sid,
+        },
+    )
+    assert response.status_code == 200
+    run_ids = response.json()["run_ids"]
+    session = service.session(sid)
+    launch = session["console_messages"][-1]
+    assert launch["source"] == "Attack Lab"
+    assert launch["card"]["type"] == "history"
+    assert launch["launch_run_ids"] == run_ids
+    assert "against 2 bots" in launch["content"]
+    assert session["console_run_id"] is None
+    assert session["console_pending_runs"] == run_ids
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.session(sid)
+        if len([m for m in session["console_messages"] if m.get("completion_run_id")]) == 2:
+            break
+        time.sleep(0.01)
+    completions = [m for m in session["console_messages"] if m.get("completion_run_id")]
+    assert {m["completion_run_id"] for m in completions} == set(run_ids)
+    assert session["console_pending_runs"] == []
+
+
 def test_report_uses_automatic_voice_delivery_instead_of_pending_manual_action(lab):
     service, client, sid = lab
     service.store.put("run", "paged", {"id": "paged", "status": "completed", "results": [], "page": {"mode": "twilio_voice", "status": "Accepted"}})

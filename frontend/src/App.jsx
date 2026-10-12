@@ -304,6 +304,7 @@ export default function App() {
         apply_defense: applyDefense,
         target_id: targetId,
         rounds,
+        workspace_session_id: session?.id || null,
       });
       setSelectedResult(0);
       setRun(next);
@@ -681,6 +682,7 @@ export default function App() {
             {page === "Attack lab" && (
               <AttackLab
                 overview={overview}
+                sessionId={session?.id}
                 run={run}
                 result={result}
                 selectedResult={selectedResult}

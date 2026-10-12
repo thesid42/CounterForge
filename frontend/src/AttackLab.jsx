@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
@@ -64,8 +64,219 @@ function responseText(value) {
   return text + calls;
 }
 
+function BatchAttack({
+  overview,
+  scenario,
+  applyDefense,
+  locked,
+  openRun,
+  sessionId,
+}) {
+  const bots = (overview.targets || []).filter((t) => t.adapter === "dvaa");
+  const [picked, setPicked] = useState([]);
+  const [batch, setBatch] = useState(null);
+  const [error, setError] = useState("");
+  const live = batch?.status === "running";
+  const allPicked = bots.length > 0 && picked.length === bots.length;
+  useEffect(() => {
+    fetch("/api/lab/batches")
+      .then((r) => r.json())
+      .then((list) => list?.[0] && setBatch(list[0]))
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!live) return;
+    const timer = setInterval(async () => {
+      const next = await fetch("/api/lab/batches/" + batch.id).then((r) =>
+        r.json(),
+      );
+      setBatch(next);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [live, batch?.id]);
+  const toggle = (id) =>
+    setPicked((cur) =>
+      cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id],
+    );
+  async function launch() {
+    setError("");
+    const res = await fetch("/api/lab/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target_ids: picked,
+        scenario,
+        apply_defense: applyDefense,
+        workspace_session_id: sessionId || null,
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) return setError(body.detail || "Could not start the batch");
+    setBatch(body);
+  }
+  return (
+    <section className="panel al-batch" aria-label="Attack multiple bots">
+      <div className="al-batch-head">
+        <div className="al-batch-title">
+          <h3>Attack multiple DVAA bots at once</h3>
+          <p className="muted">
+            Run the selected attack surface against several bots in parallel.
+          </p>
+        </div>
+        <div className="al-batch-actions">
+          <span className="al-batch-count" aria-live="polite">
+            <strong>{picked.length}</strong> of {bots.length} selected
+          </span>
+          <button
+            type="button"
+            className="cf-text-button al-select-all"
+            disabled={live || locked}
+            onClick={() => setPicked(allPicked ? [] : bots.map((b) => b.id))}
+          >
+            {allPicked ? "Clear selection" : `Select all ${bots.length}`}
+          </button>
+          <button
+            className="button primary"
+            disabled={!picked.length || live || locked}
+            onClick={launch}
+          >
+            {live ? (
+              <Loader2 size={16} className="spin" />
+            ) : (
+              <FlaskConical size={16} />
+            )}
+            {live
+              ? "Running batch…"
+              : picked.length
+                ? `Attack ${picked.length} ${picked.length === 1 ? "bot" : "bots"}`
+                : "Run batch"}
+          </button>
+        </div>
+      </div>
+      <div className="al-batch-grid">
+        {bots.map((b) => {
+          const name = b.name.replace("DVAA ", "");
+          const selected = picked.includes(b.id);
+          return (
+            <label
+              key={b.id}
+              className={"al-batch-bot " + (selected ? "on" : "")}
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                disabled={live || locked}
+                onChange={() => toggle(b.id)}
+                aria-label={`Select ${name} on port ${b.port}`}
+              />
+              <span className="al-batch-bot-copy">
+                <strong title={name}>{name}</strong>
+                <small>
+                  Port {b.port}
+                  <span className={"lvl " + b.security_level}>
+                    {b.security_level}
+                  </span>
+                </small>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      {error && <p className="al-batch-error">{error}</p>}
+      {batch && (
+        <details className="al-batch-results" open={live || undefined}>
+          <summary>
+            <span>
+              {live ? (
+                <Loader2 size={14} className="spin" />
+              ) : (
+                <CheckCircle2 size={14} />
+              )}
+              {live ? "Batch in progress" : "Latest batch results"}
+            </span>
+            <small>{batch.runs.length} bots</small>
+            <ChevronDown size={14} />
+          </summary>
+          <div className="al-batch-table-wrap">
+            <table className="al-batch-table">
+              <thead>
+                <tr>
+                  <th>Bot</th>
+                  <th>Status</th>
+                  <th>Breaches</th>
+                  <th>Blocked after defense</th>
+                  <th>Call</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {batch.runs.map((r) => (
+                  <tr key={r.run_id}>
+                    <td>
+                      {(r.target || "").replace("DVAA ", "")}{" "}
+                      <small>:{r.port}</small>
+                    </td>
+                    <td>
+                      {["running", "batched"].includes(r.status) ? (
+                        <span className="al-batch-status">
+                          <Loader2 size={13} className="spin" />{" "}
+                          {STAGE_LABELS[r.stage] || "Waiting…"}
+                        </span>
+                      ) : r.status === "failed" ? (
+                        <span className="al-outcome error">Failed</span>
+                      ) : (
+                        <span className="al-outcome blocked">Done</span>
+                      )}
+                    </td>
+                    <td>
+                      {r.attacks ? (
+                        <span
+                          className={
+                            "al-outcome " +
+                            (r.breaches ? "succeeded" : "blocked")
+                          }
+                        >
+                          {r.breaches}/{r.attacks}
+                        </span>
+                      ) : (
+                        "–"
+                      )}
+                    </td>
+                    <td>
+                      {r.attacks ? `${r.blocked_after}/${r.attacks}` : "–"}
+                    </td>
+                    <td>
+                      {r.page === "Accepted"
+                        ? "Called"
+                        : r.page === "Suppressed"
+                          ? "Suppressed"
+                          : "–"}
+                    </td>
+                    <td>
+                      {r.status === "completed" && (
+                        <button
+                          type="button"
+                          className="cf-text-button"
+                          onClick={() => openRun(r.run_id)}
+                        >
+                          Open
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+    </section>
+  );
+}
+
 export default function AttackLab({
   overview,
+  sessionId,
   run,
   result,
   selectedResult,
@@ -165,11 +376,25 @@ export default function AttackLab({
               disabled={locked}
               onChange={(e) => setTargetId(e.target.value)}
             >
-              {(overview.targets || []).map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name} · {t.model}
-                </option>
-              ))}
+              <optgroup label="DVAA personas (live fleet)">
+                {(overview.targets || [])
+                  .filter((t) => t.adapter === "dvaa")
+                  .map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name.replace("DVAA ", "")} · :{t.port} ·{" "}
+                      {t.security_level?.toUpperCase()}
+                    </option>
+                  ))}
+              </optgroup>
+              <optgroup label="CounterForge agents">
+                {(overview.targets || [])
+                  .filter((t) => t.adapter !== "dvaa")
+                  .map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} · {t.model}
+                    </option>
+                  ))}
+              </optgroup>
             </select>
           </div>
           <label className="al-rules-toggle">
@@ -184,7 +409,9 @@ export default function AttackLab({
           </label>
         </div>
         <p className="al-persona-note">
-          {overview.personas?.[selectedTarget?.persona]?.description ||
+          {(selectedTarget?.adapter === "dvaa" &&
+            `${selectedTarget.description} (DVAA on :${selectedTarget.port})`) ||
+            overview.personas?.[selectedTarget?.persona]?.description ||
             "Select a registered local target."}
         </p>
         <div className="al-launch-row">
@@ -277,6 +504,15 @@ export default function AttackLab({
           </div>
         </details>
       </section>
+
+      <BatchAttack
+        overview={overview}
+        scenario={scenario}
+        applyDefense={applyDefense}
+        locked={locked}
+        openRun={openRun}
+        sessionId={sessionId}
+      />
 
       <details className="panel al-register">
         <summary>

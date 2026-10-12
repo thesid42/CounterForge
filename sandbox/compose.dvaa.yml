@@ -16,8 +16,9 @@ services:
       OPENAI_BASE_URL: 'http://host.docker.internal:11434/v1'
       DVAA_AIM_DATA_DIR: /tmp/aim
     ports:
-      - 127.0.0.1:7005:7005
-      - 127.0.0.1:7006:7006
+      - 127.0.0.1:7001-7008:7001-7008
+      - 127.0.0.1:7014-7018:7014-7018
+      - 127.0.0.1:7022-7023:7022-7023
       - 127.0.0.1:9000:9000
     networks: [lab]
     read_only: true
