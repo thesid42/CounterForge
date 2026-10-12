@@ -90,6 +90,23 @@ def fake_roles(monkeypatch):
     return observations, executions
 
 
+@pytest.mark.parametrize("target_id", ["local-support", "dvaa-helperbot"])
+def test_batch_metadata_survives_graph_and_replay_keeps_selected_target(service, monkeypatch, target_id):
+    fake_roles(monkeypatch)
+    profiles = []
+    async def execute(attack, policy, defense_prompt=None):
+        profiles.append(attack["target_profile"]["id"])
+        return {"verdict": "succeeded", "output": "test reply", "trace": [], "tool_calls": []}
+    monkeypatch.setattr(workflow, "execute_lab_attack_async", execute)
+    state = workflow.new_campaign(service, "data-extraction", target=resolve_target(service, target_id), autonomous=False, rounds=1)
+    state["batch_id"] = "test-batch"
+    asyncio.run(workflow.run_campaign(service, workflow.make_graph(service), state))
+    run = service.store.get("run", state["id"])
+    assert run["status"] == "completed" and run["batch_id"] == "test-batch"
+    assert profiles == [target_id, target_id]
+    assert service.store.list("incident") == []  # The controller owns the shared incident.
+
+
 @pytest.mark.parametrize("rules_on", [True, False])
 def test_autonomous_loop_retests_same_payload_and_evolves_from_replay(service, monkeypatch, rules_on):
     observations, executions = fake_roles(monkeypatch)
@@ -139,7 +156,7 @@ def test_final_defense_must_pass_earlier_payloads_before_saving(service, monkeyp
         return {"verdict": "succeeded" if success else "blocked", "output": "Useful reply", "trace": [], "tool_calls": []}
     monkeypatch.setattr(workflow, "DefenderAgent", Defender)
     monkeypatch.setattr(workflow, "execute_lab_attack_async", execute)
-    state = workflow.new_campaign(service, "data-extraction", target=resolve_target(service, "local-support"), autonomous=True, rounds=2)
+    state = workflow.new_campaign(service, "data-extraction", apply_defense=True, target=resolve_target(service, "local-support"), autonomous=True, rounds=2)
     asyncio.run(workflow.run_campaign(service, workflow.make_graph(service), state))
     run = service.store.get("run", state["id"])
     assert run["status"] == "completed"

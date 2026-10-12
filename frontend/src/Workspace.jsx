@@ -170,14 +170,20 @@ export default function Workspace({
     const sid = session.id;
     let disposed = false;
     let loading = false;
+    let completed = new Set((session.console_messages || []).filter((m) => m.completion_run_id).map((m) => m.id));
     const load = async () => {
       if (loading || busyRef.current) return;
       loading = true;
       const version = requestVersion.current;
       try {
         const next = await api("/sessions/" + sid);
-        if (!disposed && !busyRef.current && version === requestVersion.current)
+        if (!disposed && !busyRef.current && version === requestVersion.current) {
           setSession((current) => (current?.id === sid ? next : current));
+          const completions = (next.console_messages || []).filter((m) => m.completion_run_id);
+          const changed = completions.some((m) => !completed.has(m.id));
+          completed = new Set(completions.map((m) => m.id));
+          if (changed) await refresh();
+        }
       } catch (e) {
         if (!disposed) setError(e.message);
       } finally {
@@ -258,10 +264,10 @@ export default function Workspace({
       setOptimistic("");
     }
   }
-  const targetName =
+  const targetName = selectedRun?.is_batch ? selectedRun.target?.name || "Multiple agents" :
     overview.targets?.find(
-      (t) => t.id === (preferences?.target_id || "local-incident"),
-    )?.name || "Incident assistant";
+      (t) => t.id === preferences?.target_id,
+    )?.name || "Choose an agent";
   const readable = (content) =>
     runs.reduce(
       (text, saved) =>
@@ -338,8 +344,8 @@ export default function Workspace({
                 </span>
                 <h2>How can I help?</h2>
                 <p>
-                  Try “Use the support assistant, defense off, one round.” Then
-                  say “Start a new run.”
+                  Try “Run the support assistant, one round.” Or say “Start a
+                  new run” and choose an agent when asked.
                 </p>
                 <p>
                   Ask “show settings” to check your setup, or “disable chat
@@ -484,7 +490,7 @@ export default function Workspace({
             <div className="cf-composer-foot">
               <span>
                 {targetName} · Defense{" "}
-                {preferences?.apply_defense === false ? "off" : "on"} ·{" "}
+                {preferences?.apply_defense === true ? "on" : "off"} ·{" "}
                 {preferences?.rounds || 2}{" "}
                 {preferences?.rounds === 1 ? "round" : "rounds"}
                 {preferences?.allow_runs === false
@@ -504,7 +510,7 @@ export default function Workspace({
           <p>Select a run to load its conversation. Use the arrow for Attack Lab details.</p>
           {runs.length ? (
             <RunList
-              runs={runs.slice(0, 12)}
+              runs={runs}
               selectedId={selectedId}
               select={selectRun}
               disabled={busy}

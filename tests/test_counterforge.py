@@ -145,7 +145,7 @@ def test_incident_deduplication_and_page_cooldown(service):
 
 
 def test_campaign_replay_activation_and_rollback(service):
-    state = new_campaign(service, "all")
+    state = new_campaign(service, "all", apply_defense=True)
     asyncio.run(run_campaign(service, make_graph(service), state))
     run = service.store.get("run", state["id"])
     assert run["status"] == "completed" and run["validated"]
@@ -161,7 +161,7 @@ def test_campaign_replay_activation_and_rollback(service):
 
 
 def test_unvalidated_or_stale_candidates_cannot_activate(service):
-    state = new_campaign(service, "runbook-injection")
+    state = new_campaign(service, "runbook-injection", apply_defense=True)
     with pytest.raises(ValueError, match="validated"):
         service.activate(state["id"])
     asyncio.run(run_campaign(service, make_graph(service), state))

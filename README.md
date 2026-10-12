@@ -69,14 +69,23 @@ In **Attack lab**, choose a persona target and the visible **Defense rules** tog
 
 Run selection belongs to each conversation and survives switching chats or reloading the page. Starting a test selects the newly created run. An unselected chat never silently uses the latest saved run; explicitly ask about the latest run or recent comparisons to access that evidence. User messages and their person icons sit on the right; CounterForge replies sit on the left. The input clears immediately on send; a failed request restores the draft without overwriting a newer draft.
 
+Run activity has a capped height and scrolls internally, keeping all saved runs accessible without stretching the page.
+
 Runs started from chat, Attack Lab, or agent registration post a short completion summary to the originating conversation automatically. The summary describes the attack methods, observed leaks or unauthorized actions, the defense comparison when available, and alert delivery. Progress appears while a watched run is active. Failed or incomplete checks are identified, and each completion is saved once, including after reconnecting or reloading. You do not need to ask for status, and clearing a selection does not reattach it when a summary arrives. Summaries use recorded results and remain available without an analyst provider connection.
 
 Configure chat runs through text. Selectors, toggles, and advanced controls remain in Attack Lab. Chat preferences persist per conversation.
 
+Defense rules are off by default for chat launches, Attack Lab tests, and automatic tests on agent registration. Explicitly say **defense on** or enable the Attack Lab toggle to compare defenses. Changing agents resets defense to off unless you explicitly enable it for the new agent.
+
+Each new chat run requires an agent choice. Say **Run the support assistant** to choose directly. If you say **Start a new run** without naming an agent, CounterForge asks which one to test and waits for your reply. Reply with an agent name or **any**; “any” picks an available target and the launch reply names it. A saved selection from an older run is never used as an implicit agent choice. Say **cancel** to dismiss a pending request.
+
+For a multi-agent test, name multiple targets, for example **Run HelperBot and LegacyBot, one round, context check**. **Run all DVAA bots** selects the fleet. Attack Lab's batch selector uses the same execution and summary flow. Each batch appears once in Run activity, posts one automatic summary with attack outcomes for each target, and creates one shared security incident and alert request when breaches are observed. Individual payloads and responses remain available in Attack Lab's batch results. Defense is off by default for batches too.
+
 | Say this in chat | Result |
 | --- | --- |
 | Use the support assistant, defense off, one round, context check. | Save the setup without starting a run. |
-| Start a new run. | Launch a test with the saved setup. |
+| Start a new run. | Ask which agent to test, preserving the requested rounds and attack surface. |
+| Any. (after the agent question) / Run any agent. | Pick an available target, name it, and launch the test. |
 | Run the knowledge assistant with defense on, one round, context check. | Configure and launch a test in one message. |
 | Show settings. | Show the current chat setup. |
 | Disable chat runs. / Enable chat runs. | Pause or allow launches from this conversation. Attack Lab remains available. |
@@ -91,7 +100,7 @@ The evidence analyst uses a fixed system prompt in `backend/console.py` for cons
 
 ## Demo walkthrough
 
-1. Start a **New chat** in Workspace. Configure a short test, for example **Use the support assistant, defense off, one round, context check.** Then say **Start a new run**.
+1. Start a **New chat** in Workspace. Launch a short test, for example **Run the support assistant, one round, context check.** Or say **Start a new run**, then choose an agent when asked.
 2. The newly created run becomes the chat's selection. A short attack summary appears automatically when it completes. Ask follow-up questions for more detail, or clear the selection to return to a general conversation.
 3. Use the run's arrow in **Run activity** to open **Attack lab**. Choose a target, attack surface, and **Defense rules** setting, then **Run test**. Select an attack to see its payload and both responses; expand **View full execution traces** for the evidence. **Advanced options** contains attempt limits and saved-defense controls.
 4. Ask CounterForge to compare recent runs, or select a particular run to discuss its evidence. A defense is credited only when that run's own unprotected attempt breached and the same payload with defense did not.

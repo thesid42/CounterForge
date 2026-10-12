@@ -18,6 +18,7 @@ from .console import (
     WorkspaceConsole,
     assistant_config,
     run_summary,
+    activity_runs,
 )
 from .models import ApprovalRequest, ChatRequest, LabBatchRequest, LabRequest
 from .roles import live_lab_ready, role_models_configured
@@ -57,6 +58,9 @@ def create_app(service=None):
         for run in service.store.list("run"):
             if run["status"] in {"running", "batched"}:
                 service.store.put("run", run["id"], {**run, "status": "failed", "stage": "error", "error": "Backend restarted during evaluation"})
+        for batch in service.store.list("batch"):
+            if batch["status"] == "running":
+                await finalize_batch(batch["id"])
         for session in service.store.list("session"):
             await console.sync_run_updates(session["id"])
         schedule()
@@ -96,13 +100,32 @@ def create_app(service=None):
             async with limit:
                 running = {**state, "status": "running"}
                 service.store.put("run", state["id"], running)
-                await run_campaign(service, graph, running)
-                await console.publish_run_completion(state["id"])
+                try:
+                    await run_campaign(service, graph, running)
+                except Exception:
+                    latest = service.store.get("run", state["id"]) or running
+                    service.store.put("run", state["id"], {**latest, "status": "failed", "stage": "error", "error": "Evaluation could not finish"})
 
         await asyncio.gather(*(one(s) for s in states), return_exceptions=True)
+        await finalize_batch(batch_id)
+        # Schedule queued registrations after this batch releases admission.
+        asyncio.get_running_loop().call_soon(schedule)
+
+    async def finalize_batch(batch_id):
         batch = service.store.get("batch", batch_id)
-        service.store.put("batch", batch_id, {**batch, "status": "completed", "completed_at": now()})
-        schedule()
+        members = [service.store.get("run", rid) for rid in batch["run_ids"]]
+        batch = {**batch, "status": "failed" if any(r["status"] == "failed" for r in members) else "completed", "completed_at": now()}
+        findings = service.record_lab_findings({"id": batch_id, "results": [row for r in members for row in r.get("results", [])]})
+        if findings:
+            batch.update(security_incident_id=findings["incident"]["id"], alert_action_id=findings["action"]["id"], page=findings.get("page"))
+            incident = findings["incident"]
+            incident.update(title=batch.get("name", "Multi-agent test"), run_ids=batch["run_ids"], batch_id=batch_id)
+            service.store.put("incident", incident["id"], incident)
+            for r in members:
+                service.store.put("run", r["id"], {**r, "security_incident_id": incident["id"], "alert_action_id": findings["action"]["id"], "page": findings.get("page")})
+        service.store.put("batch", batch_id, batch)
+        for r in members:
+            await console.publish_run_completion(r["id"])
 
     def batch_view(batch):
         runs = [service.store.get("run", rid) or {} for rid in batch["run_ids"]]
@@ -117,8 +140,7 @@ def create_app(service=None):
                          "page": (r.get("page") or {}).get("status"), "error": r.get("error")})
         return {**batch, "runs": rows}
 
-    @app.post("/api/lab/batches")
-    async def start_batch(payload: LabBatchRequest):
+    async def launch_batch(payload: LabBatchRequest):
         if any(not t.done() for t in tasks):
             raise HTTPException(409, "A comparison is already running")
         if not live_lab_ready() and not role_models_configured() and not settings.ALLOW_SIMULATION:
@@ -131,15 +153,16 @@ def create_app(service=None):
         batch_id = uuid4().hex
         states = []
         try:
-            for tid in dict.fromkeys(payload.target_ids):
+            targets = [resolve_target(service, tid) for tid in dict.fromkeys(payload.target_ids)]
+            for target in targets:
                 state = new_campaign(service, payload.scenario, apply_defense=payload.apply_defense,
-                                     target=resolve_target(service, tid), autonomous=False, rounds=payload.rounds)
+                                     target=target, autonomous=False, rounds=payload.rounds)
                 state = {**state, "batch_id": batch_id, "status": "batched"}
                 service.store.put("run", state["id"], state)
                 states.append(state)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        batch = {"id": batch_id, "status": "running", "created_at": now(), "scenario": payload.scenario,
+        batch = {"id": batch_id, "name": f"Multi-agent test {len(service.store.list('batch')) + 1}", "status": "running", "created_at": now(), "scenario": payload.scenario,
                  "apply_defense": payload.apply_defense, "run_ids": [s["id"] for s in states]}
         service.store.put("batch", batch_id, batch)
         if payload.workspace_session_id:
@@ -150,6 +173,10 @@ def create_app(service=None):
         tasks.add(task)
         task.add_done_callback(tasks.discard)
         return batch_view(batch)
+
+    @app.post("/api/lab/batches")
+    async def start_batch(payload: LabBatchRequest):
+        return await launch_batch(payload)
 
     @app.get("/api/lab/batches")
     def list_batches():
@@ -162,7 +189,7 @@ def create_app(service=None):
             raise HTTPException(404, "Batch not found")
         return batch_view(batch)
 
-    console = WorkspaceConsole(service, launch)
+    console = WorkspaceConsole(service, launch, launch_batch)
 
     @app.get("/api/agents")
     def agents():
@@ -183,7 +210,7 @@ def create_app(service=None):
     @app.get("/api/workspace")
     def workspace():
         runs = sorted(service.store.list("run"), key=lambda r: r.get("created_at", ""), reverse=True)
-        return {"assistant": assistant_config(), "runs": [run_summary(r) for r in runs],
+        return {"assistant": assistant_config(), "runs": activity_runs(service),
                 "target_model": settings.TARGET_MODEL or "Synthetic fixture", "target_mode": "dvaa" if settings.MODEL_MODE != "demo" and settings.TARGET_BASE_URL else "local-simulation"}
 
     @app.post("/api/sessions/{sid}/console")

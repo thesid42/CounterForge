@@ -9,12 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
 from .config import settings
-from .models import LabRequest
+from .models import LabRequest, LabBatchRequest
 from .policy import redact
 from .service import now
 from .agents import target_catalog
 from .run_names import run_name, SCENARIO_NAMES
-from .chat_commands import default_preferences, parse_command, configuration_text
+from .chat_commands import default_preferences, parse_command, configuration_text, target_choice, target_reply, command_text, batch_target_choices
 
 
 ANALYST_SYSTEM_PROMPT = """You are CounterForge's evidence analyst. Explain saved security tests to someone unfamiliar with security terminology.
@@ -40,7 +40,7 @@ class ConsoleRequest(BaseModel):
     scenario: LabRequest.model_fields["scenario"].annotation = "all"
     run_id: str | None = Field(default=None, max_length=64)
     target_id: str | None = Field(default=None, max_length=64)
-    apply_defense: bool = True
+    apply_defense: bool = False
     rounds: int = Field(default=2, ge=1, le=3)
 
 
@@ -69,9 +69,9 @@ def run_summary(run):
     legacy_live = live and run.get("mode") != "managed-agent" and (not run.get("adaptive") or not all(r.get("defended", {}).get("defense_supported") for r in results))
     def count(side, verdict):
         return sum(r.get(side, {}).get("verdict") == verdict for r in results)
-    return {"id": run["id"], "name": run_name(run), "apply_defense": run.get("apply_defense", True), "scenario": run.get("scenario", "all"), "status": run.get("status"),
+    return {"id": run["id"], "name": run_name(run), "batch_id": run.get("batch_id"), "apply_defense": run.get("apply_defense", True), "scenario": run.get("scenario", "all"), "status": run.get("status"),
             "stage": run.get("stage"), "created_at": run.get("created_at"), "completed_at": run.get("completed_at"),
-            "mode": "managed-agent" if run.get("mode") == "managed-agent" else "dvaa" if live else "local-simulation", "total": len(results),
+            "mode": "multi-agent" if run.get("is_batch") else "managed-agent" if run.get("mode") == "managed-agent" else "dvaa" if live else "local-simulation", "total": len(results),
             "baseline_breaches": count("baseline", "succeeded"), "replay_breaches": count("defended", "succeeded"),
             "replay_blocked": count("defended", "blocked"), "errors": count("baseline", "error") + count("defended", "error"),
             "replay_total": sum(bool(r.get("defended")) for r in results),
@@ -79,12 +79,12 @@ def run_summary(run):
             "target_model": run.get("target_model", "Not recorded"),
             "target": run.get("target"), "comparison": run.get("comparison"),
             "timeline": run.get("timeline", []),
-            "limitation": "Repeated DVAA probe; model defense is unverified. Historical gateway labels may reflect filtering after execution." if legacy_live else "Persona model with disposable tools; recorded attacks only." if run.get("mode") == "managed-agent" else "Adaptive evaluation with generated defense and gateway; results apply only to recorded attacks." if live else "Deterministic synthetic tool execution; not a real-model robustness score."}
+            "limitation": "Results cover the recorded attacks on the selected agents only. Defense support can differ by agent." if run.get("is_batch") else "Repeated DVAA probe; model defense is unverified. Historical gateway labels may reflect filtering after execution." if legacy_live else "Persona model with disposable tools; recorded attacks only." if run.get("mode") == "managed-agent" else "Adaptive evaluation with generated defense and gateway; results apply only to recorded attacks." if live else "Deterministic synthetic tool execution; not a real-model robustness score."}
 
 
 def evidence(run):
     return {**run_summary(run), "findings": [
-        {"id": r.get("id"), "name": r.get("name"), "category": r.get("category"), "payload": clean(r.get("payload", ""))[:600],
+        {"id": r.get("id"), "name": r.get("name"), "target": r.get("target_name") or (run.get("target") or {}).get("name"), "category": r.get("category"), "payload": clean(r.get("payload", ""))[:600],
          **{side: {**{key: clean(r.get(side, {}).get(key, ""))[:600] for key in ("verdict", "model_verdict", "reason", "output", "response_content", "canary_leaked", "unauthorized_actions", "defense_enforced")}, "tools_requested": [c.get("name") for c in r.get(side, {}).get("tool_calls", [])[:6]]}
             for side in ("baseline", "defended")}} for r in run.get("results", [])]}
 
@@ -138,6 +138,46 @@ def completion_summary(run):
     return plain_answer(clean("\n\n".join(paragraphs)))
 
 
+def batch_run(service, batch):
+    members = [service.store.get("run", rid) for rid in batch["run_ids"]]
+    members = [r for r in members if r]
+    active = next((r for r in members if r.get("status") == "running"), None)
+    return {**batch, "id": batch["run_ids"][0], "batch_id": batch["id"], "is_batch": True,
+            "name": batch.get("name", "Multi-agent test"), "member_ids": batch["run_ids"],
+            "stage": active.get("stage") if active else "complete" if batch["status"] in {"completed", "failed"} else "queued",
+            "results": [{**row, "target_name": (r.get("target") or {}).get("name")} for r in members for row in r.get("results", [])], "members": members,
+            "target": {"name": f"{len(members)} agents"}, "target_model": "Multiple targets"}
+
+
+def saved_runs(service):
+    rows, seen = [], set()
+    for run in sorted(service.store.list("run"), key=lambda r: r.get("created_at", ""), reverse=True):
+        bid = run.get("batch_id")
+        batch = service.store.get("batch", bid) if bid else None
+        if batch:
+            if bid in seen:
+                continue
+            seen.add(bid)
+            grouped = batch_run(service, batch)
+            rows.append(grouped)
+        else:
+            rows.append(run)
+    return sorted(rows, key=lambda r: r.get("created_at", ""), reverse=True)
+
+
+def activity_runs(service):
+    return [{**run_summary(run), "is_batch": run.get("is_batch", False), "member_ids": run.get("member_ids", [])} for run in saved_runs(service)]
+
+
+def batch_completion_summary(service, batch):
+    grouped = batch_run(service, batch)
+    outcomes = []
+    for r in grouped["members"]:
+        summary = run_summary(r)
+        outcomes.append(f"{(r.get('target') or {}).get('name', run_name(r))}: {summary['baseline_breaches']} breach{'es' if summary['baseline_breaches'] != 1 else ''} in {summary['total']} attack{'s' if summary['total'] != 1 else ''}" + ("; checks incomplete" if r["status"] == "failed" or summary["errors"] else "") + ".")
+    return completion_summary(grouped) + "\n\n" + "\n".join(outcomes)
+
+
 def assistant_config():
     model = settings.DEFENDER_MODEL
     # OpenRouter requires the organization prefix; verified against its catalogue.
@@ -180,8 +220,9 @@ async def explain(question, history, context, reply_style="brief"):
 
 
 class WorkspaceConsole:
-    def __init__(self, service, start_run):
+    def __init__(self, service, start_run, start_batch=None):
         self.service, self.start_run = service, start_run
+        self.start_batch = start_batch
         self.locks = {}
 
     def pending_runs(self, session):
@@ -202,6 +243,19 @@ class WorkspaceConsole:
             for run_id in dict.fromkeys(pending):
                 run = self.service.store.get("run", run_id)
                 if not run:
+                    continue
+                batch = self.service.store.get("batch", run.get("batch_id", ""))
+                if batch:
+                    if batch["status"] not in {"completed", "failed"}:
+                        remaining.append(run_id)
+                        continue
+                    if any(m.get("completion_batch_id") == batch["id"] for m in history):
+                        continue
+                    history.append({"id": "completion-batch-" + batch["id"], "role": "assistant", "run_id": batch["run_ids"][0],
+                                    "completion_run_id": batch["run_ids"][0], "completion_batch_id": batch["id"], "batch_id": batch["id"],
+                                    "content": batch_completion_summary(self.service, batch), "source": "Run summary", "detailed": True,
+                                    "card": {"type": "run", "run_id": batch["run_ids"][0], "name": batch.get("name", "Multi-agent test")}, "timestamp": now()})
+                    added.append(run_id)
                     continue
                 if run.get("status") not in {"completed", "failed"}:
                     remaining.append(run_id)
@@ -245,7 +299,7 @@ class WorkspaceConsole:
                 dict.fromkeys([*self.pending_runs(session), *run_ids])
             )
             if batch:
-                session["console_run_id"] = None
+                session["console_run_id"] = runs[0]["id"]
             else:
                 session["console_run_id"] = runs[0]["id"]
             if new_runs:
@@ -253,11 +307,11 @@ class WorkspaceConsole:
                 if batch:
                     content = (
                         f"Started a batch from Attack Lab against {len(new_runs)} bots. "
-                        f"Defense {defense}. I will post each result here when it finishes."
+                        f"Defense {defense}. I'll post the attack summary here when it finishes."
                     )
                     card = {
-                        "type": "history",
-                        "runs": [run_summary(run) for run in new_runs],
+                        "type": "run", "run_id": runs[0]["id"],
+                        "name": (self.service.store.get("batch", runs[0].get("batch_id")) or {}).get("name", "Multi-agent test"),
                     }
                     if session.get("title") == "New chat":
                         session["title"] = f"Attack Lab batch, {len(new_runs)} bots"
@@ -280,7 +334,7 @@ class WorkspaceConsole:
                     {
                         "id": "lab-launch-" + (runs[0].get("batch_id") or runs[0]["id"]),
                         "role": "assistant",
-                        "run_id": None if batch else runs[0]["id"],
+                        "run_id": runs[0]["id"], "batch_id": runs[0].get("batch_id"),
                         "launch_run_ids": [run["id"] for run in new_runs],
                         "content": content,
                         "source": "Attack Lab",
@@ -296,8 +350,12 @@ class WorkspaceConsole:
         return session
 
     async def resume_run_chat(self, run_id, fallback_sid=None):
-        if not self.service.store.get("run", run_id):
+        run = self.service.store.get("run", run_id)
+        if not run:
             raise KeyError("Run not found")
+        batch = self.service.store.get("batch", run.get("batch_id", ""))
+        if batch:
+            run_id = batch["run_ids"][0]
         sessions = self.service.store.list("session")
         origin = next((s for s in sessions if s.get("console_chat_run_id") == run_id or any(
             m.get("source") == "Run controller" and (m.get("card") or {}).get("run_id") == run_id
@@ -321,8 +379,11 @@ class WorkspaceConsole:
             run = self.service.store.get("run", run_id) if run_id else None
             if run_id is not None and not run:
                 raise KeyError("Run not found")
-            if run and (watch or run.get("status") in {"queued", "running"}):
-                session["console_pending_runs"] = list(dict.fromkeys([*self.pending_runs(session), run_id]))
+            batch = self.service.store.get("batch", run.get("batch_id", "")) if run else None
+            if batch:
+                run_id = batch["run_ids"][0]
+            if run and (watch or run.get("status") in {"queued", "running", "batched"}):
+                session["console_pending_runs"] = list(dict.fromkeys([*self.pending_runs(session), *(batch["run_ids"] if batch else [run_id])]))
             session["console_run_id"] = run_id
             self.service.store.put("session", sid, session)
             return session
@@ -333,15 +394,26 @@ class WorkspaceConsole:
             text = clean(request.message.strip())
             if not text:
                 raise ValueError("Message cannot be blank")
-            runs = sorted(self.service.store.list("run"), key=lambda r: r.get("created_at", ""), reverse=True)
+            runs = saved_runs(self.service)
             selected_id = request.run_id if "run_id" in request.model_fields_set else session.get("console_run_id")
             selected = self.service.store.get("run", selected_id) if selected_id else None
             if selected_id and not selected:
                 raise KeyError("Run not found")
+            selected_batch = self.service.store.get("batch", selected.get("batch_id", "")) if selected else None
+            if selected_batch:
+                selected = batch_run(self.service, selected_batch)
             history = session.setdefault("console_messages", [])
             preferences = {**default_preferences(), **session.get("console_config", {})}
             targets = target_catalog(self.service)
-            command, configured = parse_command(text, preferences, targets)
+            pending = session.get("console_pending_launch")
+            batch_ids = batch_target_choices(text, targets)
+            answering_target = bool(pending and target_reply(text, targets))
+            if answering_target:
+                preferences = {**preferences, **pending["config"]}
+                command, configured = parse_command("Use " + text, preferences, targets)
+                command = "start"
+            else:
+                command, configured = parse_command(text, preferences, targets, multiple_targets=bool(batch_ids))
             compare = bool(re.search(r"\b(compar(?:e|ing|ison)|recent runs|latest (?:runs|checks|tests)|changed|across|versus)\b", text.lower()))
             # Access global recent evidence only when explicitly requested.
             if not command and re.search(r"\b(?:latest|most recent|last)\s+(?:run|test|check)\b", text.lower()) and runs:
@@ -351,6 +423,7 @@ class WorkspaceConsole:
             # a bounded run. Analyst output and saved evidence have no authority.
             start = request.action == "start" or command == "start"
             card, started, detailed = None, None, False
+            started_batch = None
             if start:
                 if not configured["allow_runs"]:
                     raise ValueError('Chat runs are disabled. Say "enable chat runs" to turn them on; Attack Lab remains available.')
@@ -358,20 +431,60 @@ class WorkspaceConsole:
                 for key in ("scenario", "target_id", "apply_defense", "rounds"):
                     if key in explicit:
                         configured[key] = getattr(request, key)
-                started = await self.start_run(LabRequest(**{key: configured[key] for key in ("scenario", "target_id", "apply_defense", "rounds")}))
+                # A historical selection or saved target is not a choice for a new test.
+                chosen = configured["target_id"] if answering_target or "target_id" in explicit or (not batch_ids and target_choice(text, targets, pick_any=False)) else None
+                if "target_id" in explicit and chosen != preferences.get("target_id") and "apply_defense" not in explicit:
+                    configured["apply_defense"] = False
+                if batch_ids:
+                    if not self.start_batch:
+                        raise ValueError("Multi-agent tests are unavailable.")
+                    if len(batch_ids) > 16:
+                        raise ValueError("Choose at most 16 agents per test.")
+                    _, configured = parse_command(text, {**configured, "apply_defense": False}, targets, multiple_targets=True)
+                    if "apply_defense" in explicit:
+                        configured["apply_defense"] = request.apply_defense
+                    started_batch = await self.start_batch(LabBatchRequest(target_ids=batch_ids, scenario=configured["scenario"], apply_defense=configured["apply_defense"], rounds=configured["rounds"]))
+                    started = self.service.store.get("run", started_batch["run_ids"][0])
+                elif not chosen:
+                    configured["target_id"] = None
+                    if "apply_defense" not in explicit:
+                        _, configured = parse_command(text, {**configured, "apply_defense": False}, targets)
+                    session["console_run_id"] = None
+                    session["console_config"] = configured
+                    session["console_pending_launch"] = {"config": {key: configured[key] for key in ("scenario", "target_id", "apply_defense", "rounds")}, "message_ids": []}
+                    content = 'Which agent should I test? Reply with an agent name, or say "any" and I\'ll pick one.'
+                    source = "Run controller"
+                else:
+                    configured["target_id"] = chosen
+                    if answering_target and not re.search(r"\bdefen[cs]e|\bwith(?:out)?\b", command_text(text)):
+                        configured["apply_defense"] = pending["config"]["apply_defense"]
+                    started = await self.start_run(LabRequest(**{key: configured[key] for key in ("scenario", "target_id", "apply_defense", "rounds")}))
+            if started:
+                if pending:
+                    for m in history:
+                        if m["id"] in pending.get("message_ids", []):
+                            m["run_id"] = started["id"]
+                session.pop("console_pending_launch", None)
                 session["console_config"] = configured
                 session["console_run_id"] = started["id"]
-                session["console_pending_runs"] = list(dict.fromkeys([*self.pending_runs(session), started["id"]]))
+                session["console_pending_runs"] = list(dict.fromkeys([*self.pending_runs(session), *(started_batch["run_ids"] if started_batch else [started["id"]])]))
                 selected = started
                 card = {"type": "run", "run_id": started["id"], "name": run_name(started)}
                 content, source = f"Started {run_name(started)}. Defense {'on' if configured['apply_defense'] else 'off'} · {configured['rounds']} round{'s' if configured['rounds'] != 1 else ''}. I'll post the attack summary here when it finishes.", "Run controller"
-            elif command in {"configure", "settings"}:
+                if started_batch:
+                    card["name"] = started_batch["name"]
+                    names = [t["name"] for tid in batch_ids for t in targets if t["id"] == tid]
+                    content = f"Started {started_batch['name']} for " + ", ".join(names) + f". Defense {'on' if configured['apply_defense'] else 'off'} · {configured['rounds']} round{'s' if configured['rounds'] != 1 else ''}. I'll post the attack summary here when it finishes."
+            elif not start and pending and re.fullmatch(r"(?:please )?(?:cancel|never mind|nevermind|forget it|stop)(?: the (?:run|test))?[.!]?", text.lower().strip()):
+                session.pop("console_pending_launch", None)
+                content, source = "Cancelled the pending test. No run was started.", "Run controller"
+            elif not start and command in {"configure", "settings"}:
                 session["console_config"] = configured
                 content, source = configuration_text(configured, targets), "Chat settings"
-            elif request.action == "history" or (not compare and re.search(r"\b(history|timeline|chart|previous runs|past runs)\b", text.lower())):
+            elif not start and (request.action == "history" or (not compare and re.search(r"\b(history|timeline|chart|previous runs|past runs)\b", text.lower()))):
                 card = {"type": "history", "runs": [run_summary(r) for r in runs[:12]]}
                 content, source = "Select a run to open its payloads, responses, and results in Attack Lab.", "Saved evidence"
-            else:
+            elif not start:
                 detailed = preferences["reply_style"] == "details" or bool(re.search(r"\b(details|detailed|in detail|full explanation|deep dive)\b", text.lower()))
                 context = {"selected_run": evidence(selected) if selected else None,
                            "chat_settings": configuration_text(preferences, targets),
@@ -384,6 +497,8 @@ class WorkspaceConsole:
                 content, source = await explain(text, scoped_history, context, preferences["reply_style"])
                 card = {"type": "run", "run_id": selected["id"], "name": run_name(selected)} if selected else None
             history.extend([{"id": uuid4().hex, "role": "user", "content": text, "run_id": session["console_run_id"], "timestamp": now()}, {"id": uuid4().hex, "role": "assistant", "content": content, "run_id": session["console_run_id"], "source": source, "card": card, "detailed": detailed, "timestamp": now()}])
+            if start and not started:
+                session["console_pending_launch"]["message_ids"] = [m["id"] for m in history[-2:]]
             session["title"] = history[0]["content"][:45]
             self.service.store.put("session", sid, session)
-            return {"session": session, "started_run": started}
+            return {"session": session, "started_run": started, "started_batch": started_batch}

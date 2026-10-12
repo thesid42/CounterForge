@@ -44,7 +44,7 @@ class AgentRegistration(BaseModel):
     model: str = Field(min_length=1, max_length=100)
     base_url: str = "http://127.0.0.1:11434/v1"
     auto_run: bool = True
-    apply_defense: bool = True
+    apply_defense: bool = False
     rounds: int = Field(default=2, ge=1, le=3)
     scenario: Literal["all", "runbook-injection", "tool-result-injection", "role-escalation", "data-extraction"] = "all"
 

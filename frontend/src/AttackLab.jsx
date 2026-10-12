@@ -71,6 +71,7 @@ function BatchAttack({
   locked,
   openRun,
   sessionId,
+  selectedBatchId,
 }) {
   const bots = (overview.targets || []).filter((t) => t.adapter === "dvaa");
   const [picked, setPicked] = useState([]);
@@ -79,11 +80,11 @@ function BatchAttack({
   const live = batch?.status === "running";
   const allPicked = bots.length > 0 && picked.length === bots.length;
   useEffect(() => {
-    fetch("/api/lab/batches")
+    fetch(selectedBatchId ? "/api/lab/batches/" + selectedBatchId : "/api/lab/batches")
       .then((r) => r.json())
-      .then((list) => list?.[0] && setBatch(list[0]))
+      .then((value) => { if (selectedBatchId) setBatch(value); else if (value?.[0]) setBatch(value[0]); })
       .catch(() => {});
-  }, []);
+  }, [selectedBatchId]);
   useEffect(() => {
     if (!live) return;
     const timer = setInterval(async () => {
@@ -204,8 +205,8 @@ function BatchAttack({
                   <th>Bot</th>
                   <th>Status</th>
                   <th>Breaches</th>
-                  <th>Blocked after defense</th>
-                  <th>Call</th>
+                  <th>{batch.apply_defense ? "No breach with defense" : "No breach on repeat"}</th>
+                  <th>Alert</th>
                   <th></th>
                 </tr>
               </thead>
@@ -247,7 +248,7 @@ function BatchAttack({
                     </td>
                     <td>
                       {r.page === "Accepted"
-                        ? "Called"
+                        ? batch.page?.mode === "simulated" ? "Simulated" : "Accepted"
                         : r.page === "Suppressed"
                           ? "Suppressed"
                           : "–"}
@@ -374,7 +375,10 @@ export default function AttackLab({
               id="lab-target"
               value={targetId}
               disabled={locked}
-              onChange={(e) => setTargetId(e.target.value)}
+              onChange={(e) => {
+                setTargetId(e.target.value);
+                setApplyDefense(false);
+              }}
             >
               <optgroup label="DVAA personas (live fleet)">
                 {(overview.targets || [])
@@ -512,6 +516,7 @@ export default function AttackLab({
         locked={locked}
         openRun={openRun}
         sessionId={sessionId}
+        selectedBatchId={run?.batch_id}
       />
 
       <details className="panel al-register">

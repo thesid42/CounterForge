@@ -176,7 +176,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [scenario, setScenario] = useState("all");
-  const [applyDefense, setApplyDefense] = useState(true);
+  const [applyDefense, setApplyDefense] = useState(false);
   const [targetId, setTargetId] = useState("local-incident");
   const [rounds, setRounds] = useState(2);
   const [run, setRun] = useState(null);

@@ -17,6 +17,7 @@ from .run_names import run_name
 
 class Campaign(TypedDict, total=False):
     id: str
+    batch_id: str
     name: str
     scenario: str
     status: str
@@ -208,6 +209,7 @@ def make_graph(service):
                     "payload": result["payload"],
                     "tool": result["tool"],
                     "arguments": result["arguments"],
+                    "target_profile": state.get("target"),
                 }
                 if apply_defense:
                     defended = await execute_lab_attack_async(
@@ -383,7 +385,7 @@ async def run_campaign(service, graph, state):
     await service.broker.publish(state["id"], {"type": "finished"})
 
 
-def new_campaign(service, scenario, apply_defense: bool = True, target=None, autonomous=False, rounds=None):
+def new_campaign(service, scenario, apply_defense: bool = False, target=None, autonomous=False, rounds=None):
     managed_ready = bool(target and target.get("adapter") == "managed" and role_models_configured())
     if not live_lab_ready() and not managed_ready and not settings.ALLOW_SIMULATION:
         raise ValueError(

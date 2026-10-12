@@ -398,6 +398,9 @@ class LabService:
             return action
 
     def record_lab_findings(self, run):
+        # The batch controller records one incident after all members finish.
+        if run.get("batch_id"):
+            return None
         breaches = [
             result for result in run.get("results", [])
             if result.get("baseline", {}).get("verdict") == "succeeded"

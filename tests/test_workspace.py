@@ -42,7 +42,7 @@ def test_history_is_persisted_and_does_not_invent_runs(lab):
 
 def test_run_commands_and_legacy_lab_share_admission_gate(lab):
     service, client, sid = lab
-    response = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run", "scenario": "runbook-injection"})
+    response = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run on any agent", "scenario": "runbook-injection"})
     run = response.json()["started_run"]
     assert run["scenario"] == "runbook-injection"
     assert run["timeline"][0]["stage"] == "queued"
@@ -113,7 +113,7 @@ def test_provider_failure_is_not_a_fabricated_answer(lab, monkeypatch):
 
 def test_campaign_preserves_recorded_timeline(lab):
     service, client, sid = lab
-    state = new_campaign(service, "all")
+    state = new_campaign(service, "all", apply_defense=True)
     asyncio.run(run_campaign(service, make_graph(service), state))
     run = service.store.get("run", state["id"])
     assert [e["stage"] for e in run["timeline"]] == ["queued", "generate", "execute", "inspect", "propose", "replay", "complete"]
@@ -149,7 +149,7 @@ def test_adaptive_live_summary_and_activation_keep_upstream_behavior(lab):
 def test_workspace_start_respects_live_configuration_gate(lab, monkeypatch):
     service, client, sid = lab
     monkeypatch.setattr(settings, "ALLOW_SIMULATION", False)
-    response = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run"})
+    response = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run on any agent"})
     assert response.status_code == 409
     assert client.post("/api/lab/runs", json={"scenario": "all"}).status_code == 409
     assert not service.store.list("run")
@@ -168,6 +168,8 @@ def test_text_configuration_persists_and_controls_natural_chat_launches(lab):
     assert configured["started_run"] is None
     assert configured["session"]["console_config"] == {"target_id": "local-support", "scenario": "data-extraction", "apply_defense": False, "rounds": 1, "allow_runs": True, "reply_style": "brief"}
     result = asyncio.run(console.chat(sid, ConsoleRequest(message="Could you start a new run?")))
+    assert result["started_run"] is None and "Which agent" in result["session"]["console_messages"][-1]["content"]
+    result = asyncio.run(console.chat(sid, ConsoleRequest(message="Support assistant")))
     assert launched[0].target_id == "local-support"
     assert not launched[0].apply_defense and launched[0].rounds == 1
     assert "internal-opaque-id" not in result["session"]["console_messages"][-1]["content"]
@@ -292,6 +294,9 @@ def test_natural_run_requests_start_new_runs_instead_of_explaining_old_evidence(
     console = WorkspaceConsole(service, start)
     asyncio.run(console.select_run(sid, "old"))
     result = asyncio.run(console.chat(sid, ConsoleRequest(message=message)))
+    if result["started_run"] is None:
+        assert "Which agent" in result["session"]["console_messages"][-1]["content"]
+        result = asyncio.run(console.chat(sid, ConsoleRequest(message="Incident assistant")))
     assert len(launched) == 1 and not launched[0].apply_defense
     assert result["started_run"]["id"] == result["session"]["console_run_id"] == "new"
     assert result["session"]["console_messages"][-1]["card"]["run_id"] == "new"
@@ -315,7 +320,7 @@ def test_completion_is_automatically_posted_once_to_origin_chat_without_a_status
             "id": "data-extraction-r1", "baseline": {"verdict": "succeeded", "canary_leaked": True},
             "defended": {"verdict": "succeeded"}}]})
     monkeypatch.setattr("backend.main.run_campaign", campaign)
-    started = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run with defense off"}).json()
+    started = client.post(f"/api/sessions/{sid}/console", json={"message": "Start a new run on any agent with defense off"}).json()
     run_id = started["started_run"]["id"]
     assert started["session"]["console_pending_runs"] == [run_id]
     assert len(started["session"]["console_messages"]) == 2
@@ -410,7 +415,7 @@ def test_attack_lab_launch_is_immediately_visible_in_workspace_chat(lab, monkeyp
     release.set()
 
 
-def test_attack_lab_batch_is_visible_and_posts_each_completion(lab, monkeypatch):
+def test_attack_lab_batch_is_visible_and_posts_one_completion(lab, monkeypatch):
     service, client, sid = lab
     release = Event()
 
@@ -435,20 +440,22 @@ def test_attack_lab_batch_is_visible_and_posts_each_completion(lab, monkeypatch)
     session = service.session(sid)
     launch = session["console_messages"][-1]
     assert launch["source"] == "Attack Lab"
-    assert launch["card"]["type"] == "history"
+    assert launch["card"]["type"] == "run"
     assert launch["launch_run_ids"] == run_ids
     assert "against 2 bots" in launch["content"]
-    assert session["console_run_id"] is None
+    assert session["console_run_id"] == run_ids[0]
     assert session["console_pending_runs"] == run_ids
     release.set()
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         session = service.session(sid)
-        if len([m for m in session["console_messages"] if m.get("completion_run_id")]) == 2:
+        if len([m for m in session["console_messages"] if m.get("completion_batch_id")]) == 1:
             break
         time.sleep(0.01)
     completions = [m for m in session["console_messages"] if m.get("completion_run_id")]
-    assert {m["completion_run_id"] for m in completions} == set(run_ids)
+    assert len(completions) == 1
+    assert completions[0]["completion_batch_id"] == response.json()["id"]
+    assert {m["completion_run_id"] for m in completions} == {run_ids[0]}
     assert session["console_pending_runs"] == []
 
 
@@ -500,3 +507,135 @@ def test_switch_run_conversation_restores_running_run_and_keeps_updates_in_origi
     assert completed["console_pending_runs"] == []
     assert all(m.get("run_id") == "older" for m in client.get(f"/api/sessions/{older['id']}").json()["console_messages"])
     assert client.post("/api/lab/runs/active/chat", json={"session_id": older["id"]}).json() == completed
+
+
+def test_unnamed_run_waits_for_agent_and_preserves_requested_settings(lab, monkeypatch):
+    service, _, sid = lab
+    launched = []
+    async def start(request):
+        launched.append(request)
+        return {"id": "chosen", "name": "Support · Context check 1", "status": "queued"}
+    async def explain(*args):
+        return "Support helps customers.", "test"
+    monkeypatch.setattr("backend.console.explain", explain)
+    console = WorkspaceConsole(service, start)
+    session = service.session(sid)
+    session["console_config"] = {"target_id": "local-incident", "apply_defense": True}
+    service.store.put("session", sid, session)
+    requested = asyncio.run(console.chat(sid, ConsoleRequest(message="Start a new run with defense on, one round, context check")))
+    assert not launched and requested["started_run"] is None
+    assert requested["session"]["console_run_id"] is None
+    assert "Which agent" in requested["session"]["console_messages"][-1]["content"]
+    question = asyncio.run(console.chat(sid, ConsoleRequest(message="Why choose the support assistant?")))
+    assert question["started_run"] is None and not launched
+    chosen = asyncio.run(console.chat(sid, ConsoleRequest(message="Use the support assistant")))
+    assert len(launched) == 1 and launched[0].target_id == "local-support"
+    assert launched[0].apply_defense and launched[0].rounds == 1
+    assert launched[0].scenario == "data-extraction"
+    assert "console_pending_launch" not in chosen["session"]
+    assert chosen["session"]["console_messages"][0]["run_id"] == "chosen"
+    assert chosen["session"]["console_messages"][1]["run_id"] == "chosen"
+
+
+@pytest.mark.parametrize("message", ["Run any agent", "Start a new run on any one", "any"])
+def test_any_agent_selects_available_target_once_and_defaults_defense_off(lab, monkeypatch, message):
+    service, _, sid = lab
+    launched, picks = [], []
+    def pick(targets):
+        picks.append(targets)
+        return next(t for t in targets if t["id"] == "local-research")
+    monkeypatch.setattr("backend.chat_commands.choice", pick)
+    async def start(request):
+        launched.append(request)
+        return {"id": "any-choice", "name": "Knowledge · Full security check 1", "status": "queued"}
+    console = WorkspaceConsole(service, start)
+    if message == "any":
+        asyncio.run(console.chat(sid, ConsoleRequest(message="Start a new run")))
+    result = asyncio.run(console.chat(sid, ConsoleRequest(message=message)))
+    assert len(picks) == 1 and len(launched) == 1
+    assert launched[0].target_id == "local-research" and not launched[0].apply_defense
+    assert "Started Knowledge" in result["session"]["console_messages"][-1]["content"]
+
+
+def test_pending_target_choice_cannot_override_disabled_runs_and_can_be_cancelled(lab):
+    service, _, sid = lab
+    launched = []
+    async def start(request):
+        launched.append(request)
+        return {"id": "unexpected"}
+    console = WorkspaceConsole(service, start)
+    asyncio.run(console.chat(sid, ConsoleRequest(message="Start a new run")))
+    asyncio.run(console.chat(sid, ConsoleRequest(message="Disable chat runs")))
+    with pytest.raises(ValueError, match="Chat runs are disabled"):
+        asyncio.run(console.chat(sid, ConsoleRequest(message="any")))
+    cancelled = asyncio.run(console.chat(sid, ConsoleRequest(message="cancel")))
+    assert not launched and "console_pending_launch" not in cancelled["session"]
+    assert "No run was started" in cancelled["session"]["console_messages"][-1]["content"]
+
+
+def test_new_target_resets_defense_unless_explicitly_enabled(lab):
+    from backend.chat_commands import default_preferences, parse_command
+    from backend.agents import AgentRegistration, target_catalog
+    from backend.models import LabRequest
+    service, _, _ = lab
+    preferences = {**default_preferences(), "target_id": "local-incident", "apply_defense": True}
+    _, changed = parse_command("Run the support assistant", preferences, target_catalog(service))
+    assert not changed["apply_defense"]
+    _, enabled = parse_command("Run the support assistant with defense on", preferences, target_catalog(service))
+    assert enabled["apply_defense"]
+    assert not LabRequest().apply_defense and not ConsoleRequest(message="Start").apply_defense
+    assert not AgentRegistration(name="New support", model="local").apply_defense
+
+
+def test_chat_batch_posts_one_summary_and_records_one_incident_for_all_targets(lab, monkeypatch):
+    service, client, sid = lab
+    release = Event()
+    async def campaign(service, graph, state):
+        while not release.is_set():
+            await asyncio.sleep(.01)
+        finished = {**state, "status": "completed", "results": [{"id": "data-extraction", "surface": "data_extraction",
+                    "baseline": {"verdict": "succeeded", "canary_leaked": True}, "defended": {"verdict": "succeeded"}}]}
+        assert service.record_lab_findings(finished) is None
+        service.store.put("run", state["id"], finished)
+    monkeypatch.setattr("backend.main.run_campaign", campaign)
+    response = client.post(f"/api/sessions/{sid}/console", json={"message": "Run support and knowledge assistants, one round, context check"})
+    assert response.status_code == 200, response.text
+    started = response.json()
+    batch = started["started_batch"]
+    assert len(batch["run_ids"]) == 2 and not batch["apply_defense"]
+    activity = client.get("/api/workspace").json()["runs"]
+    assert len(activity) == 1 and activity[0]["is_batch"]
+    assert activity[0]["member_ids"] == batch["run_ids"]
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.session(sid)
+        completions = [m for m in session["console_messages"] if m.get("completion_batch_id")]
+        if completions:
+            break
+        time.sleep(.01)
+    assert len(completions) == 1
+    assert "Support assistant" in completions[0]["content"] and "Knowledge assistant" in completions[0]["content"]
+    assert "2 of 2" in completions[0]["content"]
+    assert "1 breach in 1 attack." in completions[0]["content"]
+    from backend.console import batch_run
+    grouped_evidence = evidence(batch_run(service, service.store.get("batch", batch["id"])))
+    assert grouped_evidence["mode"] == "multi-agent"
+    assert {row["target"] for row in grouped_evidence["findings"]} == {"Support assistant", "Knowledge assistant"}
+    assert len(service.store.list("incident")) == 1 and len(service.store.list("action")) == 1
+    incident = service.store.list("incident")[0]
+    assert incident["run_ids"] == batch["run_ids"] and incident["batch_id"] == batch["id"]
+    assert all(service.store.get("run", rid)["security_incident_id"] == incident["id"] for rid in batch["run_ids"])
+    assert not session["console_pending_runs"]
+    assert len(client.get(f"/api/sessions/{sid}").json()["console_messages"]) == 3
+    restored = client.post(f"/api/lab/runs/{batch['run_ids'][1]}/chat", json={"session_id": sid}).json()
+    assert restored["console_run_id"] == batch["run_ids"][0]
+    contexts = []
+    async def explain_batch(question, history, context, reply_style):
+        contexts.append(context)
+        return "Both agents revealed the test secret.", "test"
+    monkeypatch.setattr("backend.console.explain", explain_batch)
+    latest = client.post(f"/api/sessions/{sid}/console", json={"message": "Tell me about the latest run and compare recent runs"}).json()
+    assert latest["session"]["console_messages"][-1]["card"]["name"] == batch["name"]
+    assert contexts[0]["selected_run"]["total"] == 2
+    assert len(contexts[0]["recent_runs"]) == 1
