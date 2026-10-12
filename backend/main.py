@@ -9,21 +9,45 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .fixtures import INCIDENTS
 from .config import settings
+from .console import ConsoleRequest, WorkspaceConsole, assistant_config, run_summary
 from .models import ApprovalRequest, ChatRequest, LabRequest
 from .roles import live_lab_ready, role_models_configured
 from .service import LabService
 from .workflow import make_graph, new_campaign, run_campaign
+from .agents import AgentRegistration, PERSONAS, register_agent, resolve_target, target_catalog
+from .policy import redact
+from .run_names import run_name
 
 
 def create_app(service=None):
     service = service or LabService()
     tasks = set()
 
+    async def drain_runs():
+        while True:
+            pending = sorted((r for r in service.store.list("run") if r["status"] == "queued"), key=lambda r: r.get("created_at", ""))
+            if not pending:
+                return
+            state = {**pending[0], "status": "running"}
+            service.store.put("run", state["id"], state)
+            await run_campaign(service, graph, state)
+            agent = service.store.get("agent", state.get("target", {}).get("id", "")) if state.get("target") else None
+            if agent:
+                result = service.store.get("run", state["id"])
+                service.store.put("agent", agent["id"], {**agent, "last_run_id": state["id"], "status": result["status"]})
+
+    def schedule():
+        if not any(not t.done() for t in tasks):
+            task = asyncio.create_task(drain_runs())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
     @asynccontextmanager
     async def lifespan(app):
         for run in service.store.list("run"):
             if run["status"] == "running":
                 service.store.put("run", run["id"], {**run, "status": "failed", "stage": "error", "error": "Backend restarted during evaluation"})
+        schedule()
         yield
         for task in tasks:
             task.cancel()
@@ -33,6 +57,58 @@ def create_app(service=None):
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver"])
     app.state.service = service
     graph = make_graph(service)
+
+    async def launch(payload, enqueue=False):
+        if any(not t.done() for t in tasks) and not enqueue:
+            raise HTTPException(409, "A comparison is already running")
+        if not live_lab_ready() and not (payload.target_id and role_models_configured()) and not settings.ALLOW_SIMULATION:
+            raise HTTPException(
+                409,
+                "Live lab is not configured. Set MODEL_MODE=live, TARGET_BASE_URL, and OpenRouter attacker/defender keys.",
+            )
+        try:
+            target = resolve_target(service, payload.target_id) if payload.target_id else None
+            state = new_campaign(service, payload.scenario, apply_defense=payload.apply_defense,
+                                 target=target, autonomous=payload.autonomous, rounds=payload.rounds)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        queued = {**state, "status": "queued"}
+        service.store.put("run", state["id"], queued)
+        schedule()
+        return queued if enqueue else state
+
+    console = WorkspaceConsole(service, launch)
+
+    @app.get("/api/agents")
+    def agents():
+        return {"targets": target_catalog(service), "personas": PERSONAS}
+
+    @app.post("/api/agents")
+    async def register(payload: AgentRegistration):
+        if payload.auto_run and not role_models_configured() and not settings.ALLOW_SIMULATION:
+            raise HTTPException(409, "Configure attacker and defender models before starting an autonomous evaluation")
+        agent, created = register_agent(service, payload)
+        started = None
+        if created and payload.auto_run:
+            started = await launch(LabRequest(target_id=agent["id"], scenario=payload.scenario, apply_defense=payload.apply_defense, rounds=payload.rounds), enqueue=True)
+            agent = {**agent, "last_run_id": started["id"], "status": "queued"}
+            service.store.put("agent", agent["id"], agent)
+        return {"agent": agent, "started_run": started, "created": created}
+
+    @app.get("/api/workspace")
+    def workspace():
+        runs = sorted(service.store.list("run"), key=lambda r: r.get("created_at", ""), reverse=True)
+        return {"assistant": assistant_config(), "runs": [run_summary(r) for r in runs],
+                "target_model": settings.TARGET_MODEL or "Synthetic fixture", "target_mode": "dvaa" if settings.MODEL_MODE != "demo" and settings.TARGET_BASE_URL else "local-simulation"}
+
+    @app.post("/api/sessions/{sid}/console")
+    async def console_chat(sid: str, payload: ConsoleRequest):
+        try:
+            return await console.chat(sid, payload)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.middleware("http")
     async def local_origin(request: Request, call_next):
@@ -55,7 +131,7 @@ def create_app(service=None):
     @app.get("/api/health")
     def health():
         live = settings.MODEL_MODE != "demo" and bool(settings.TARGET_BASE_URL)
-        adaptive = live_lab_ready()
+        adaptive = live_lab_ready() or (settings.MODEL_MODE != "demo" and role_models_configured())
         return {
             "status": "ok",
             "name": "CounterForge",
@@ -72,7 +148,7 @@ def create_app(service=None):
 
     @app.get("/api/overview")
     def overview():
-        adaptive = live_lab_ready()
+        adaptive = live_lab_ready() or (settings.MODEL_MODE != "demo" and role_models_configured())
         return {
             "sessions": [{"id": s["id"], "title": s["title"]} for s in service.store.list("session")],
             "incidents": service.store.list("incident"),
@@ -89,6 +165,8 @@ def create_app(service=None):
             "attack_rounds": settings.ADAPTIVE_ATTACK_ROUNDS if adaptive else 0,
             "alert_mode": service.alert_dispatcher.mode,
             "active_defense": service.get_active_defense(),
+            "targets": target_catalog(service),
+            "personas": PERSONAS,
         }
 
     @app.post("/api/sessions")
@@ -118,21 +196,7 @@ def create_app(service=None):
 
     @app.post("/api/lab/runs")
     async def start_run(payload: LabRequest):
-        if any(not t.done() for t in tasks):
-            raise HTTPException(409, "A comparison is already running")
-        if not live_lab_ready() and not settings.ALLOW_SIMULATION:
-            raise HTTPException(
-                409,
-                "Live lab is not configured. Set MODEL_MODE=live, TARGET_BASE_URL, and OpenRouter attacker/defender keys.",
-            )
-        try:
-            state = new_campaign(service, payload.scenario, apply_defense=payload.apply_defense)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        task = asyncio.create_task(run_campaign(service, graph, state))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-        return state
+        return await launch(payload)
 
     @app.get("/api/lab/runs/{rid}")
     def run(rid: str):
@@ -166,14 +230,20 @@ def create_app(service=None):
                 alert_note += " Provider acceptance does not prove the responder answered."
         else:
             alert_note = "No live alert provider was called."
-        if value.get("adaptive"):
+        if value.get("mode") == "managed-agent":
+            mode_note = f"Model-backed {value.get('target', {}).get('persona', 'assistant')} persona, model {value.get('target_model')}, disposable local tools. Replay rules: {'on' if value.get('apply_defense') else 'off'}."
+        elif value.get("adaptive"):
             mode_note = f"Adaptive model evaluation with attacker {value.get('role_models', {}).get('attacker')} and defender {value.get('role_models', {}).get('defender')} against the local DVAA target."
         elif value.get("mode") == "dvaa":
             mode_note = "Live local DVAA target evaluation."
         else:
             mode_note = "Simulation fallback (tests only). No hosted LLM was called."
-        lines = ["# CounterForge evaluation", "", f"Mode: {mode_note} {alert_note}", f"Run: {rid}", f"Status: {value['status']}", "", "| Scenario | Baseline | Defense |", "| --- | --- | --- |"]
+        if not value.get("adaptive") and run_summary(value)["mode"] == "dvaa":
+            mode_note += " Replay is a repeated probe; candidate policy is not enforced in the target."
+        lines = ["# CounterForge evaluation", "", f"Mode: {mode_note} {alert_note}", f"Run: {run_name(value)}", f"Status: {value['status']}", "", "| Scenario | Baseline | Defense |", "| --- | --- | --- |"]
         lines.extend(f"| {r['name']} | {r['baseline']['verdict']} | {r.get('defended', {}).get('verdict', 'pending')} |" for r in value.get("results", []))
+        for row in value.get("results", []):
+            lines.extend(["", "## " + row["name"], "", "Attack payload:", "", redact(str(row.get("payload", ""))), "", "Target response (rules off):", "", redact(str(row.get("baseline", {}).get("response_content") or row.get("baseline", {}).get("output", ""))), "", "Target response (replay):", "", redact(str(row.get("defended", {}).get("response_content") or row.get("defended", {}).get("output", "")))])
         lines.extend(["", "Regression checks: " + json.dumps(value.get("validation", {})), "", "Candidate validated: " + str(value.get("validated", False)), "", "Protected markers are redacted. Outcomes apply only to this synthetic, isolated lab configuration."])
         return PlainTextResponse("\n".join(lines), headers={"Content-Disposition": f'attachment; filename="counterforge-{rid[:8]}.md"'})
 

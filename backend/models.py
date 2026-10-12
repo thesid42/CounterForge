@@ -45,6 +45,9 @@ class LabRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scenario: Literal["all", "runbook-injection", "tool-result-injection", "role-escalation", "data-extraction"] = "all"
     apply_defense: bool = True
+    target_id: str | None = Field(default=None, max_length=64)
+    autonomous: bool = True
+    rounds: int = Field(default=2, ge=1, le=3)
 
 
 class ApprovalRequest(BaseModel):

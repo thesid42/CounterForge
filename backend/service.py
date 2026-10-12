@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import secrets
 import threading
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ def apply_defense_gateway(result: dict, attack: dict, policy, defense_prompt: st
     The target may still *attempt* unauthorized tools; the lab gateway records the
     attempt and blocks the outcome so the next defended run is actually protected.
     """
+    if result.get("mode") == "dvaa":
+        return {**result, "defense_enforced": False, "defense_supported": False}
     if not defense_prompt and not getattr(policy, "block_untrusted_actions", False):
         return result
     tool_calls = result.get("tool_calls") or []
@@ -144,7 +147,7 @@ async def _run_dvaa(attack: dict, defense_prompt: str | None = None) -> dict:
         "request_content": redact(request_content),
         "response_content": redact(response_content),
         "defense_applied": bool(defense_prompt),
-        "tool_calls": [{"name": tc.name, "arguments": tc.arguments} for tc in tool_calls],
+        "tool_calls": [{"name": tc.name, "arguments": json.loads(redact(json.dumps(tc.arguments)))} for tc in tool_calls],
     }
 
 
@@ -170,9 +173,14 @@ def _run_dvaa_sync(attack: dict, defense_prompt: str | None = None) -> dict:
 
 
 async def execute_lab_attack_async(attack: dict, policy, defense_prompt: str | None = None) -> dict:
+    if attack.get("target_profile", {}).get("adapter") == "managed":
+        from .agent_runtime import run_agent
+        return await run_agent(attack, policy, defense_prompt)
     if settings.MODEL_MODE != "demo" and settings.TARGET_BASE_URL:
         result = await _run_dvaa(attack, defense_prompt)
-        return apply_defense_gateway(result, attack, policy, defense_prompt)
+        # DVAA owns execution; a host-side observation cannot undo its actions.
+        return {**result, "model_verdict": result["verdict"], "defense_enforced": False,
+                "defense_supported": False}
     if not settings.ALLOW_SIMULATION:
         raise ValueError("Live lab requires TARGET_BASE_URL; simulation fallback is disabled")
     result = execute_lab_attack(attack, policy, defense_prompt)
@@ -444,6 +452,8 @@ class LabService:
     def activate(self, run_id):
         with self.lock:
             run = self.store.get("run", run_id)
+            if run and ("dvaa" in run.get("mode", "") or any(r.get("baseline", {}).get("mode") == "dvaa" for r in run.get("results", []))) and not all(r.get("defended", {}).get("defense_supported") for r in run.get("results", [])):
+                raise ValueError("DVAA replay does not enforce the candidate policy; defense activation is unavailable")
             if not run or run["status"] != "completed" or not run.get("validated"):
                 raise ValueError("A completed, validated candidate is required")
             if run.get("activated"):

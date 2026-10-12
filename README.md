@@ -10,8 +10,9 @@ An incident-response assistant and agent-defense lab for CrowdStrike Track 3. In
 
 - Incident chat with persistent conversations, synthetic runbooks, draft updates, and a security timeline.
 - Four bounded attack objectives: runbook injection, tool-result injection, operator impersonation, and protected-context extraction. In adaptive mode, an attacker model creates new prompts over multiple rounds using redacted observations of the local target's behavior.
-- A LangGraph workflow: generate → execute → inspect → propose → replay. A separate defender model analyzes each observed attack and proposes a constrained system defense; the verdict comes from executing the attack against the target again with that defense applied.
-- Baseline/defended traces, adaptive held-out rounds, and four benign tool-permission checks. Results apply only to the configured synthetic lab and are not universal model-robustness claims.
+- A LangGraph workflow: generate → execute → inspect → propose → replay. Persona agents receive the defender's rules before replay, with tool checks applied before execution. The UI distinguishes unsafe model replies from actions stopped by enforcement.
+- Incident, support, and knowledge-assistant personas with different tools. Registering a target queues an autonomous security loop by default; manual start is also available. Later attempts use baseline and replay feedback plus strategies from earlier runs.
+- The same payload and actual redacted target responses shown side by side, with defense rules on or off. Autonomous validation covers recorded attacks and one legitimate persona task; it is not a held-out robustness score.
 - Operator activation of validated policies, stale-candidate rejection, rollback, and monotonic policy versions.
 - Action-bound paging approvals with expiry, recipient allowlisting, duplicate suppression, and rate limiting. Notifications are simulated by default or sent as sanitized Twilio voice calls when explicitly configured; acknowledgment and resolution remain operator actions.
 - Markdown/JSON reports, SQLite persistence, scoped SSE events, and a React interface with six views.
@@ -46,7 +47,7 @@ For frontend development, keep the backend running and run `npm --prefix fronten
 
 ## Adaptive attacker and defender
 
-The live target remains local DVAA backed by Ollama. To enable the two hosted roles, add one OpenRouter key to the ignored `.env` file:
+Persona targets use a local OpenAI-compatible model endpoint, defaulting to Ollama at `http://127.0.0.1:11434/v1`. They expose only disposable, synthetic tools. The legacy DVAA adapter remains available; its endpoint ignores incoming system defenses, so those replays are repeated probes and cannot validate a defense. To enable the two hosted roles, add one OpenRouter key to the ignored `.env` file:
 
 ```env
 OPENROUTER_API_KEY=
@@ -59,13 +60,19 @@ ADAPTIVE_ATTACK_ROUNDS=2
 
 `ATTACKER_API_KEY` and `DEFENDER_API_KEY` are optional per-role overrides. If they are empty, both roles use `OPENROUTER_API_KEY`. Restart the backend after changing `.env`. Role prompts and target responses are bounded and redacted before persistence; API keys are used only in authorization headers and are never placed in model prompts or reports.
 
+In **Attack lab**, choose a persona target and the visible **Defense rules** toggle. Expand **Register new agent** to set a local model, persona, and endpoint. Leave automatic evaluation enabled to queue the attack/defense loop on registration, or disable it and use **Run test** later. New registrations wait for the current run; registering the identical target again does not duplicate its run. **Advanced options** controls the one-to-three attempt limit. Rules-off runs repeat each payload without the proposed defense, while rules-on runs compare an unprotected baseline with a protected replay.
+
+Workspace contains chat and a run activity list. Click a readable run name to open its Attack Lab results; graphs, model labels, headline metrics, and the separate run inspector are removed. The analyst answers in one or two short sentences by default; ask for details when needed. Chat inputs clear on send and recover the draft if the request fails.
+
+Configure chat runs through text, for example: **Use the support assistant, defense off, one round, context check.** Then say **Start a new run**, or combine them: **Run the knowledge assistant with defense on, one round, context check.** Supported personas are incident, support, and knowledge/research; test surfaces include runbook, tool-result, authority, context, and all surfaces. Preferences persist per conversation. **Show settings**, **keep replies brief**, **use detailed replies**, **disable chat runs**, and **enable chat runs** control the assistant. Attack Lab retains its selectors and toggles. Only direct operator commands launch a bounded run; saved evidence and analyst output cannot launch one.
+
 ## Demo walkthrough
 
-1. In **Workspace**, enable **Use injected runbook**, then click **Investigate the outage**. The legitimate response remains useful; the security timeline shows the denied export.
+1. Open **Incident demo** from **Workspace**, enable **Use injected runbook**, then click **Investigate the outage**. The legitimate response remains useful; the security timeline shows the denied export.
 2. Click **Review action**, inspect the recipient, exact text, expiry, and policy version, then **Approve simulation**.
 3. In **Incidents**, acknowledge the simulated page and resolve the incident. No external call occurs.
-4. In **Attack lab**, choose **All attack surfaces** and **Run comparison**. Inspect matching baseline/defended traces and the replay evidence.
-5. Review the candidate rule, **Activate in local lab**, then inspect **Defenses**. Rollback remains available.
+4. In **Attack lab**, choose a target and attack surface, then **Run test**. Select an attack to see its payload and both responses; expand **View full execution traces** for the evidence. **Advanced options** contains attempt limits and saved-defense controls.
+5. Choose **Review defense**, then **Activate policy** when the recorded checks pass. Inspect **Defenses**; rollback remains available. Older DVAA runs without an applied defense are labeled as repeated probes and cannot be activated.
 6. Download the Markdown or JSON evidence from **Reports**.
 
 ## Optional Twilio voice alerts
