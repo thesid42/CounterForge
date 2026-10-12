@@ -366,7 +366,9 @@ def make_graph(service):
 async def run_campaign(service, graph, state):
     try:
         result = await graph.ainvoke(state)
-        service.store.put("run", state["id"], result)
+        stored = service.store.get("run", state["id"]) or {}
+        extras = {k: stored[k] for k in ("security_incident_id", "alert_action_id", "page") if k in stored}
+        service.store.put("run", state["id"], {**result, **extras})
     except Exception as exc:
         logging.getLogger("counterforge").exception("lab run failed")
         latest = service.store.get("run", state["id"]) or state
