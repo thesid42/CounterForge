@@ -70,7 +70,7 @@ The intended attacker uses a hosted GLM endpoint. GLM may also provide defense a
 Next implementation steps:
 
 1. Add the GLM client, structured attack/tool schemas, bounded retries, cost limits, and independent attacker/defender histories.
-2. Connect the CrowdStrike target through a target adapter. A supplied model or container can run locally; an API-only target remains remote.
+2. Connect the organizer-recommended DVAA environment through a target adapter. See [target integration findings](docs/TARGETS.md) and the prepared `sandbox/compose.dvaa.yml` profile. DVAA is not yet connected to the UI.
 3. Implement process/container isolation with resource limits, restricted network access, synthetic data, and separate credentials. Current fixture state isolation is **not** an OS sandbox and must not execute arbitrary tools or supplied model code.
 4. Add PagerDuty Events or Twilio voice behind the existing approval boundary, with verified provider callbacks and durable delivery records.
 
